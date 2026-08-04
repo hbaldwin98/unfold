@@ -44,9 +44,9 @@ if (!app) {
 app.innerHTML = `
   <section class="shell">
     <header class="masthead">
-      <div>
-        <p class="eyebrow">Worked Examples</p>
-        <h1>Understand it<br>one step at a time.</h1>
+      <div class="brand">
+        <h1>Worked Examples</h1>
+        <p>Guidance and examples for the problem in front of you.</p>
       </div>
       <button class="provider-button" id="open-settings" type="button">
         <span id="provider-dot" class="status-dot"></span>
@@ -56,8 +56,8 @@ app.innerHTML = `
 
     <section class="workspace">
       <form class="composer" id="prompt-form">
-        <label for="prompt">What should we work through?</label>
-        <textarea id="prompt" rows="4" placeholder="For example: Solve 2x² + 7x - 4 = 0 and explain each step."></textarea>
+        <label for="prompt">What are you working on?</label>
+        <textarea id="prompt" rows="2" placeholder="Ask for guidance and a worked example..."></textarea>
         <div class="composer-actions">
           <label class="search-option">
             <input id="web-search" type="checkbox">
@@ -73,8 +73,7 @@ app.innerHTML = `
 
       <article class="result empty" id="result" aria-live="polite">
         <div class="empty-state" id="empty-state">
-          <span>01</span>
-          <p>Ask for a worked example and the explanation will appear here.</p>
+          <p>Your guidance and worked example will appear here.</p>
         </div>
         <div class="result-status hidden" id="result-status"></div>
         <div class="markdown hidden" id="markdown"></div>
@@ -90,8 +89,8 @@ app.innerHTML = `
     <form class="settings" id="settings-form" method="dialog">
       <div class="settings-heading">
         <div>
-          <p class="eyebrow">Connection</p>
-          <h2>Choose how to think.</h2>
+          <h2>Connection</h2>
+          <p>Choose the model used for worked examples.</p>
         </div>
         <button class="icon-button" id="close-settings" type="button" aria-label="Close settings">&times;</button>
       </div>
@@ -229,6 +228,12 @@ elements.accountAction.addEventListener("click", () => void changeChatgptAccount
 elements.promptForm.addEventListener("submit", (event) => {
   event.preventDefault();
   void generate();
+});
+elements.prompt.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    void generate();
+  }
 });
 elements.stop.addEventListener("click", () => void invoke("cancel_generation"));
 
@@ -415,8 +420,13 @@ function scheduleMarkdownRender() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
+    const distanceFromBottom =
+      elements.result.scrollHeight - elements.result.scrollTop - elements.result.clientHeight;
     elements.markdown.innerHTML = renderMarkdown(output);
     secureRenderedLinks(elements.markdown);
+    if (distanceFromBottom < 80) {
+      elements.result.scrollTop = elements.result.scrollHeight;
+    }
   });
 }
 

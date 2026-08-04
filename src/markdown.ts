@@ -12,10 +12,12 @@ const blockMath: TokenizerAndRendererExtension = {
   name: "blockMath",
   level: "block",
   start(source) {
-    return source.indexOf("$$");
+    return firstDelimiter(source, ["$$", "\\["]);
   },
   tokenizer(source) {
-    const match = /^\$\$\s*([\s\S]+?)\s*\$\$(?:\n|$)/.exec(source);
+    const match =
+      /^\$\$\s*([\s\S]+?)\s*\$\$(?:\n|$)/.exec(source) ??
+      /^\\\[\s*([\s\S]+?)\s*\\\](?:\n|$)/.exec(source);
     if (!match?.[1]) return;
     return { type: "blockMath", raw: match[0], text: match[1] };
   },
@@ -35,10 +37,10 @@ const inlineMath: TokenizerAndRendererExtension = {
   name: "inlineMath",
   level: "inline",
   start(source) {
-    return source.indexOf("$");
+    return firstDelimiter(source, ["$", "\\("]);
   },
   tokenizer(source) {
-    const match = /^\$([^\n$]+?)\$/.exec(source);
+    const match = /^\$([^\n$]+?)\$/.exec(source) ?? /^\\\(([^\n]+?)\\\)/.exec(source);
     if (!match?.[1]) return;
     return { type: "inlineMath", raw: match[0], text: match[1] };
   },
@@ -55,6 +57,11 @@ const inlineMath: TokenizerAndRendererExtension = {
 };
 
 marked.use({ extensions: [blockMath, inlineMath] });
+
+function firstDelimiter(source: string, delimiters: string[]): number | undefined {
+  const indexes = delimiters.map((delimiter) => source.indexOf(delimiter)).filter((index) => index >= 0);
+  return indexes.length > 0 ? Math.min(...indexes) : undefined;
+}
 
 export function renderMarkdown(markdown: string): string {
   const html = marked.parse(markdown, { async: false, gfm: true });

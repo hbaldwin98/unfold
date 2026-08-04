@@ -1,7 +1,7 @@
 # Worked Examples
 
-A focused Windows desktop application that turns a question into a clear,
-step-by-step worked example.
+A focused Windows desktop application that helps a learner approach a question
+through guidance and a fully solved analogous example.
 
 The app supports:
 
@@ -10,6 +10,7 @@ The app supports:
 - Optional provider-native web search.
 - Streaming Markdown with KaTeX mathematics.
 - Source links, cancellation, and responsive desktop/mobile-width layouts.
+- A bounded application viewport with independently scrolling input and output.
 
 See [PLAN.md](PLAN.md) for the architecture, security rules, scope, and
 acceptance criteria for this vertical slice.

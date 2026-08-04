@@ -13,11 +13,16 @@
     "windows": [
       {
         "title": "Worked Examples",
-        "width": 1080,
-        "height": 760,
-        "minWidth": 640,
-        "minHeight": 560,
-        "resizable": true
+        "width": 680,
+        "height": 860,
+        "minWidth": 420,
+        "minHeight": 600,
+        "resizable": true,
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["acrylic"],
+          "color": "#00000099"
+        }
       }
     ],
     "security": {

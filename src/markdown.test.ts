@@ -13,4 +13,19 @@ describe("renderMarkdown", () => {
     expect(html).toContain("katex");
     expect(html).toContain("x");
   });
+
+  it("renders LaTeX bracket delimiters instead of exposing them as text", () => {
+    const html = renderMarkdown("\\[ \\text{complement} = \\text{target} - x \\]");
+
+    expect(html).toContain("katex-display");
+    expect(html).toContain("complement");
+    expect(html).not.toMatch(/<p>\s*\[/);
+  });
+
+  it("renders LaTeX parenthesis delimiters inline", () => {
+    const html = renderMarkdown("Use \\(x + 2\\) in the next step.");
+
+    expect(html).toContain("katex");
+    expect(html).not.toContain("\\(");
+  });
 });

@@ -2,9 +2,10 @@
 
 ## Purpose
 
-Build a focused desktop application that turns a question into a clear worked
-example. The result should explain the method, show each step, check the answer,
-and cite sources when web search is used.
+Build a focused desktop application that helps a learner approach a question
+through guidance and a closely analogous worked example. The result should
+explain the method without giving away the target answer, fully solve the
+example, and cite sources when web search is used.
 
 ## Product Slice
 
@@ -82,12 +83,13 @@ types.
 
 Every request includes application instructions asking for:
 
-1. A concise statement of the problem.
-2. The relevant idea or method.
-3. Numbered steps with no omitted transformations.
-4. A clearly identified result.
-5. A quick verification or reasonableness check.
-6. Sources for factual claims when search is enabled.
+1. A concise statement of what the learner is trying to find.
+2. The concepts, formulas, facts, or other necessary ingredients.
+3. Steps the learner can apply without revealing the target result.
+4. A closely analogous problem with different values or details.
+5. A complete step-by-step solution and check for that worked example.
+6. A final hint or question that returns the learner to their own problem.
+7. Sources for factual claims when search is enabled.
 
 The vertical slice uses Markdown rather than a rigid JSON schema so partial
 output remains useful while streaming.
@@ -124,7 +126,8 @@ output remains useful while streaming.
   necessary.
 - A compatible endpoint can be configured without exposing its key to the
   frontend after storage.
-- A prompt streams into a readable worked example.
+- A prompt streams into target guidance and a readable solved analogous example.
+- Long input and output remain inside independently scrollable application panels.
 - Search is available only for a provider/protocol that advertises support.
 - Stop cancels the active network request and leaves the UI usable.
 - Invalid credentials, occupied callback ports, malformed events, network
