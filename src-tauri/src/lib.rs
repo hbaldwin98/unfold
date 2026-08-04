@@ -52,6 +52,11 @@ fn save_settings(app: AppHandle, request: SaveSettingsRequest) -> Result<AppSnap
 }
 
 #[tauri::command]
+async fn list_models(app: AppHandle) -> Result<Vec<provider::ModelOption>, String> {
+    provider::list_models(settings::load(&app)?).await
+}
+
+#[tauri::command]
 async fn start_chatgpt_login(app: AppHandle) -> Result<String, String> {
     auth::start_login(app).await
 }
@@ -114,11 +119,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
             save_settings,
+            list_models,
             start_chatgpt_login,
             logout_chatgpt,
             generate_example,
             cancel_generation,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Worked Examples");
+        .expect("error while running Unfold");
 }

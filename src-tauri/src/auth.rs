@@ -71,7 +71,7 @@ pub async fn start_login(app: AppHandle) -> Result<String, String> {
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
             ("state", &state),
-            ("originator", "worked_examples"),
+            ("originator", "unfold"),
         ],
     )
     .map_err(|error| format!("Could not create the authorization URL: {error}"))?;
@@ -190,11 +190,7 @@ async fn receive_callback(
     };
 
     let (status, title, detail) = match &result {
-        Ok(_) => (
-            "200 OK",
-            "Sign-in complete",
-            "You can return to Worked Examples.",
-        ),
+        Ok(_) => ("200 OK", "Sign-in complete", "You can return to Unfold."),
         Err(error) => ("400 Bad Request", "Sign-in failed", error.as_str()),
     };
     let body = format!(

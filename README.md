@@ -1,32 +1,50 @@
-# Worked Examples
+# Unfold
 
-A focused Windows desktop application that helps a learner approach a question
-through guidance and a fully solved analogous example.
+A focused Windows desktop application with two ways to learn: guided Socratic
+practice or a complete, one-shot worked solution.
 
 The app supports:
 
 - ChatGPT subscription access through browser authorization.
 - OpenAI-compatible Responses and Chat Completions endpoints.
+- Account/provider model discovery with custom model IDs as a fallback.
+- Configurable reasoning effort with reasoning summaries and thinking blocks
+  excluded from the transcript.
+- Clickable first-use technical terms that stream an instant contextual side
+  note without cluttering the main lesson transcript.
 - Optional provider-native web search.
 - Streaming Markdown with KaTeX mathematics.
 - Source links, cancellation, and responsive desktop/mobile-width layouts.
 - A bounded application viewport with independently scrolling input and output.
-- Progressive hints that preserve earlier guidance.
+- Socratic dialogue that asks one purposeful question at a time and carries the
+  learner's responses into the next turn.
+- Optional AI-generated next moves for each Socratic question: concrete enough
+  to name a useful concept or operation, but stopped before calculations or
+  answers and always accompanied by free-form responses.
 - Focused step explanations and feedback on the learner's attempt.
 - An explicit target-solution reveal rather than an automatic answer.
+- One-shot Worked Example mode with ingredients, numbered reasoning, a final
+  answer, and an independent check.
 
 See [PLAN.md](PLAN.md) for the architecture, security rules, scope, and
 acceptance criteria for this vertical slice.
 
 ## Use The App
 
-1. Open **Worked Examples**.
+1. Open **Unfold**.
 2. Select the connection button in the upper-right corner.
 3. Choose a provider.
 4. Save the connection.
-5. Enter a problem and select **Work it out**.
-6. Continue with **Another hint**, **Explain a step**, or **Check my attempt**.
-7. Use **Show solution** only when you intentionally want the target answer.
+5. Reopen **Connection** to select from models returned by the saved provider
+   and choose a supported reasoning effort. Custom model IDs remain valid.
+6. Choose **Socratic** for guided practice or **Worked example** for a complete
+   solution in one response. The app remembers this choice.
+7. Enter a problem and submit it.
+8. In Socratic mode, answer each question in the composer or use **Give me a
+   hint**, **Explain a step**, or **Check my attempt**. Use **Show solution** only
+   when you intentionally want the target answer.
+9. In Worked Example mode, optionally use the composer afterward to ask about
+   any step, assumption, or alternative method.
 
 The active learning session is kept in memory while the app is open. Select
 **New problem** to clear its turns and begin again; persistent session history
@@ -38,8 +56,8 @@ Select **Sign in**. The app opens OpenAI authorization in the default browser
 and listens for the callback on `http://localhost:1455/auth/callback`.
 
 The app uses OAuth Authorization Code with PKCE. Access and refresh tokens are
-stored as one secret in Windows Credential Manager and are never sent to the
-frontend. The app refreshes an expired access token automatically.
+split across size-bounded entries in Windows Credential Manager and are never
+sent to the frontend. The app refreshes an expired access token automatically.
 
 No Codex executable is installed, bundled, or launched.
 
@@ -86,9 +104,9 @@ npm run tauri build
 
 Release artifacts are written to:
 
-- `src-tauri/target/release/worked-examples.exe`
-- `src-tauri/target/release/bundle/msi/Worked Examples_0.2.0_x64_en-US.msi`
-- `src-tauri/target/release/bundle/nsis/Worked Examples_0.2.0_x64-setup.exe`
+- `src-tauri/target/release/unfold.exe`
+- `src-tauri/target/release/bundle/msi/Unfold_0.3.0_x64_en-US.msi`
+- `src-tauri/target/release/bundle/nsis/Unfold_0.3.0_x64-setup.exe`
 
 ## Security
 

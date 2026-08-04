@@ -1,12 +1,12 @@
 [package]
-name = "worked-examples"
-version = "0.2.0"
-description = "A focused desktop app for step-by-step worked examples"
-authors = ["Worked Examples contributors"]
+name = "unfold"
+version = "0.3.0"
+description = "A focused desktop app for guided learning"
+authors = ["Unfold contributors"]
 edition = "2024"
 
 [lib]
-name = "worked_examples_lib"
+name = "unfold_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

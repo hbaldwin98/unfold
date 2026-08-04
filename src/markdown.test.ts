@@ -28,4 +28,18 @@ describe("renderMarkdown", () => {
     expect(html).toContain("katex");
     expect(html).not.toContain("\\(");
   });
+
+  it("renders marked learning terms as safe explanation buttons", () => {
+    const html = renderMarkdown(
+      'Use [[term:inverse operation]] before <img src=x onerror="alert(1)">.',
+    );
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    const term = host.querySelector<HTMLButtonElement>(".learning-term");
+
+    expect(term?.textContent).toBe("inverse operation");
+    expect(term?.dataset.term).toBe("inverse operation");
+    expect(term?.type).toBe("button");
+    expect(host.querySelector("img")?.getAttribute("onerror")).toBeNull();
+  });
 });

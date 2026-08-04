@@ -4231,6 +4231,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "unfold"
+version = "0.3.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures-util",
+ "keyring",
+ "rand 0.9.5",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "unic-char-property"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5073,28 +5095,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "worked-examples"
-version = "0.2.0"
-dependencies = [
- "base64 0.22.1",
- "futures-util",
- "keyring",
- "rand 0.9.5",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "socket2",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tokio",
- "tokio-util",
- "url",
- "uuid",
-]
 
 [[package]]
 name = "writeable"

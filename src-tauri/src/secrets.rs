@@ -2,6 +2,7 @@ use keyring::{Entry, Error};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// Keep the original service name so an in-place product rename does not orphan credentials.
 const SERVICE: &str = "com.workedexamples.desktop";
 const CHATGPT_MANIFEST: &str = "chatgpt-oauth-manifest";
 const COMPATIBLE_ACCOUNT: &str = "compatible-api-key";

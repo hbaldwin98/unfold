@@ -10,6 +10,8 @@ pub struct Settings {
     pub protocol: Protocol,
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -26,6 +28,35 @@ pub enum Protocol {
     ChatCompletions,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    #[default]
+    Default,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_api_str(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -33,6 +64,7 @@ impl Default for Settings {
             protocol: Protocol::Responses,
             base_url: "http://localhost:11434".to_owned(),
             model: "gpt-5.4-mini".to_owned(),
+            reasoning_effort: ReasoningEffort::Default,
         }
     }
 }
@@ -108,5 +140,15 @@ mod tests {
             settings.validate(),
             Err("Endpoint must use HTTP or HTTPS".to_owned())
         );
+    }
+
+    #[test]
+    fn existing_settings_default_reasoning_effort() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"provider":"chatgpt","protocol":"responses","baseUrl":"http://localhost:11434","model":"gpt-5.4-mini"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.reasoning_effort, ReasoningEffort::Default);
     }
 }
