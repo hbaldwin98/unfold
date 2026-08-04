@@ -1,0 +1,27 @@
+{
+  "name": "worked-examples",
+  "private": true,
+  "version": "0.1.2",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "test": "vitest run",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "dompurify": "^3.2.6",
+    "katex": "^0.16.22",
+    "marked": "^16.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.3",
+    "@types/katex": "^0.16.7",
+    "jsdom": "^26.1.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.6",
+    "vitest": "^3.2.4"
+  }
+}

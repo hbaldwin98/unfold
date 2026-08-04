@@ -1,0 +1,30 @@
+[package]
+name = "worked-examples"
+version = "0.1.2"
+description = "A focused desktop app for step-by-step worked examples"
+authors = ["Worked Examples contributors"]
+edition = "2024"
+
+[lib]
+name = "worked_examples_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+futures-util = "0.3"
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = "0.6"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
+tokio-util = "0.7"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
