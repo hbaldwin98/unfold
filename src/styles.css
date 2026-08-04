@@ -295,6 +295,37 @@ select:focus {
   text-transform: uppercase;
 }
 
+.target-message,
+.learner-detail {
+  width: fit-content;
+  max-width: min(88%, 620px);
+  margin: 0 0 26px auto;
+  padding: 10px 12px;
+  border: 1px solid rgb(255 255 255 / 6%);
+  border-radius: 9px;
+  color: #dfe0e2;
+  background: rgb(255 255 255 / 6%);
+}
+
+.target-message span,
+.learner-detail span,
+.turn-label {
+  display: block;
+  margin-bottom: 5px;
+  color: #85898e;
+  font-size: 0.66rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.target-message p,
+.learner-detail p {
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
 .result-status.thinking::after {
   content: "";
   display: inline-block;
@@ -322,6 +353,24 @@ select:focus {
   color: #d6d7d9;
   font-size: 0.97rem;
   line-height: 1.65;
+}
+
+.learning-turn + .learning-turn {
+  margin-top: 32px;
+  padding-top: 28px;
+  border-top: 1px solid rgb(255 255 255 / 7%);
+}
+
+.learner-detail {
+  margin-bottom: 24px;
+}
+
+.turn-label {
+  margin: 0 0 12px;
+}
+
+.turn-content > :first-child {
+  margin-top: 0;
 }
 
 .markdown h1,
@@ -369,6 +418,54 @@ select:focus {
 .sources li {
   margin: 6px 0;
   padding-left: 4px;
+}
+
+.learning-actions {
+  display: flex;
+  margin-top: 30px;
+  padding-top: 18px;
+  border-top: 1px solid rgb(255 255 255 / 7%);
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.learning-action-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.learning-action,
+.new-problem {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: 6px;
+  color: #bfc2c6;
+  background: rgb(0 0 0 / 18%);
+  font-size: 0.76rem;
+}
+
+.learning-action:hover,
+.new-problem:hover {
+  color: #e2e3e5;
+  background: rgb(255 255 255 / 6%);
+}
+
+.learning-action:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.reveal-action {
+  color: #aeb1b5;
+}
+
+.new-problem {
+  flex: 0 0 auto;
+  border-color: transparent;
+  background: transparent;
 }
 
 dialog {
@@ -546,6 +643,10 @@ dialog::backdrop {
 
   .result {
     padding: 20px 17px;
+  }
+
+  .learning-actions {
+    flex-direction: column;
   }
 
   .composer-actions,

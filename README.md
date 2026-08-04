@@ -11,6 +11,9 @@ The app supports:
 - Streaming Markdown with KaTeX mathematics.
 - Source links, cancellation, and responsive desktop/mobile-width layouts.
 - A bounded application viewport with independently scrolling input and output.
+- Progressive hints that preserve earlier guidance.
+- Focused step explanations and feedback on the learner's attempt.
+- An explicit target-solution reveal rather than an automatic answer.
 
 See [PLAN.md](PLAN.md) for the architecture, security rules, scope, and
 acceptance criteria for this vertical slice.
@@ -22,6 +25,12 @@ acceptance criteria for this vertical slice.
 3. Choose a provider.
 4. Save the connection.
 5. Enter a problem and select **Work it out**.
+6. Continue with **Another hint**, **Explain a step**, or **Check my attempt**.
+7. Use **Show solution** only when you intentionally want the target answer.
+
+The active learning session is kept in memory while the app is open. Select
+**New problem** to clear its turns and begin again; persistent session history
+is not part of this milestone.
 
 ### ChatGPT
 
@@ -78,8 +87,8 @@ npm run tauri build
 Release artifacts are written to:
 
 - `src-tauri/target/release/worked-examples.exe`
-- `src-tauri/target/release/bundle/msi/Worked Examples_0.1.2_x64_en-US.msi`
-- `src-tauri/target/release/bundle/nsis/Worked Examples_0.1.2_x64-setup.exe`
+- `src-tauri/target/release/bundle/msi/Worked Examples_0.2.0_x64_en-US.msi`
+- `src-tauri/target/release/bundle/nsis/Worked Examples_0.2.0_x64-setup.exe`
 
 ## Security
 

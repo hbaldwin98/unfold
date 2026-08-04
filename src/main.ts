@@ -2,7 +2,13 @@ import "katex/dist/katex.min.css";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { renderMarkdown } from "./markdown";
+import {
+  labelForAction,
+  previousTurns,
+  renderLearningTurns,
+  type LearningAction,
+  type LearningTurn,
+} from "./learning";
 import "./styles.css";
 
 type Provider = "chatgpt" | "compatible";
@@ -35,6 +41,8 @@ type LoginEvent = {
   error?: string;
 };
 
+type ComposerMode = "new_problem" | "idle" | "explain_step" | "check_attempt";
+
 const app = document.querySelector<HTMLElement>("#app");
 
 if (!app) {
@@ -59,7 +67,7 @@ app.innerHTML = `
         <label for="prompt">What are you working on?</label>
         <textarea id="prompt" rows="2" placeholder="Ask for guidance and a worked example..."></textarea>
         <div class="composer-actions">
-          <label class="search-option">
+          <label class="search-option" id="search-option">
             <input id="web-search" type="checkbox">
             <span>Search the web</span>
           </label>
@@ -75,11 +83,24 @@ app.innerHTML = `
         <div class="empty-state" id="empty-state">
           <p>Your guidance and worked example will appear here.</p>
         </div>
+        <section class="target-message hidden" id="target-message">
+          <span>You</span>
+          <p id="target-text"></p>
+        </section>
         <div class="result-status hidden" id="result-status"></div>
         <div class="markdown hidden" id="markdown"></div>
         <section class="sources hidden" id="sources">
           <h2>Sources</h2>
           <ol id="source-list"></ol>
+        </section>
+        <section class="learning-actions hidden" id="learning-actions" aria-label="Learning actions">
+          <div class="learning-action-list">
+            <button class="learning-action" id="another-hint" type="button">Another hint</button>
+            <button class="learning-action" id="explain-step" type="button">Explain a step</button>
+            <button class="learning-action" id="check-attempt" type="button">Check my attempt</button>
+            <button class="learning-action reveal-action" id="reveal-solution" type="button">Show solution</button>
+          </div>
+          <button class="new-problem" id="new-problem" type="button">New problem</button>
         </section>
       </article>
     </section>
@@ -155,13 +176,22 @@ const elements = {
   webSearch: requiredInput("web-search"),
   generate: requiredButton("generate"),
   stop: requiredButton("stop"),
+  searchOption: required("search-option"),
   capabilityNote: required("capability-note"),
   result: required("result"),
   emptyState: required("empty-state"),
+  targetMessage: required("target-message"),
+  targetText: required("target-text"),
   resultStatus: required("result-status"),
   markdown: required("markdown"),
   sources: required("sources"),
   sourceList: required("source-list"),
+  learningActions: required("learning-actions"),
+  anotherHint: requiredButton("another-hint"),
+  explainStep: requiredButton("explain-step"),
+  checkAttempt: requiredButton("check-attempt"),
+  revealSolution: requiredButton("reveal-solution"),
+  newProblem: requiredButton("new-problem"),
   dialog: requiredDialog("settings-dialog"),
   settingsForm: requiredForm("settings-form"),
   closeSettings: requiredButton("close-settings"),
@@ -180,9 +210,13 @@ const elements = {
 };
 
 let snapshot: Snapshot | null = null;
-let output = "";
 let renderQueued = false;
 let busy = false;
+let targetProblem = "";
+let sessionWebSearch = false;
+let composerMode: ComposerMode = "new_problem";
+let activeTurnIndex = -1;
+const learningTurns: LearningTurn[] = [];
 const sourceMap = new Map<string, string>();
 
 void initialize();
@@ -227,15 +261,28 @@ elements.settingsForm.addEventListener("submit", (event) => {
 elements.accountAction.addEventListener("click", () => void changeChatgptAccount());
 elements.promptForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  void generate();
+  void submitComposer();
 });
 elements.prompt.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
-    void generate();
+    void submitComposer();
+  } else if (event.key === "Escape" && !busy) {
+    setComposerMode(targetProblem ? "idle" : "new_problem");
   }
 });
-elements.stop.addEventListener("click", () => void invoke("cancel_generation"));
+elements.stop.addEventListener("click", () => {
+  if (busy) {
+    void invoke("cancel_generation");
+  } else {
+    setComposerMode(targetProblem ? "idle" : "new_problem");
+  }
+});
+elements.anotherHint.addEventListener("click", () => void startGeneration("another_hint"));
+elements.explainStep.addEventListener("click", () => prepareDetail("explain_step"));
+elements.checkAttempt.addEventListener("click", () => prepareDetail("check_attempt"));
+elements.revealSolution.addEventListener("click", () => void startGeneration("reveal_solution"));
+elements.newProblem.addEventListener("click", startNewProblem);
 
 elements.markdown.addEventListener("click", openExternalLink);
 elements.sourceList.addEventListener("click", openExternalLink);
@@ -354,34 +401,60 @@ function updateConnectionUI() {
     : "Chat Completions does not advertise a web-search capability.";
 }
 
-async function generate() {
-  if (busy) return;
-  const prompt = elements.prompt.value.trim();
-  if (!prompt) {
+async function submitComposer() {
+  if (busy || composerMode === "idle") return;
+  const detail = elements.prompt.value.trim();
+  if (!detail) {
     elements.prompt.focus();
     return;
   }
 
-  output = "";
-  sourceMap.clear();
+  if (composerMode === "new_problem") {
+    targetProblem = detail;
+    sessionWebSearch = elements.webSearch.checked;
+    sourceMap.clear();
+    learningTurns.length = 0;
+    elements.targetText.textContent = targetProblem;
+    elements.targetMessage.classList.remove("hidden");
+    renderSources();
+    await startGeneration("initial");
+    return;
+  }
+
+  await startGeneration(composerMode, detail);
+}
+
+async function startGeneration(action: LearningAction, detail?: string) {
+  if (busy || !targetProblem) return;
+  const context = previousTurns(learningTurns);
+  learningTurns.push({ action, label: labelForAction(action), content: "", detail });
+  activeTurnIndex = learningTurns.length - 1;
+  elements.prompt.value = "";
+
   setBusy(true);
   elements.result.classList.remove("empty");
   elements.emptyState.classList.add("hidden");
   elements.markdown.classList.remove("hidden");
-  elements.markdown.innerHTML = "";
-  elements.sources.classList.add("hidden");
   elements.resultStatus.className = "result-status thinking";
-  elements.resultStatus.textContent = "Working through it...";
+  elements.resultStatus.textContent = statusForAction(action);
+  renderLearningActions();
 
   const channel = new Channel<ResponseEvent>();
   channel.onmessage = (event) => handleResponseEvent(event);
 
   try {
     await invoke("generate_example", {
-      request: { prompt, webSearch: elements.webSearch.checked },
+      request: {
+        target: targetProblem,
+        action,
+        detail: detail ?? null,
+        previousTurns: context,
+        webSearch: sessionWebSearch,
+      },
       onEvent: channel,
     });
   } catch (error) {
+    discardEmptyActiveTurn();
     showResultError(messageFrom(error));
     setBusy(false);
   }
@@ -392,7 +465,10 @@ function handleResponseEvent(event: ResponseEvent) {
     case "started":
       return;
     case "text_delta":
-      output += event.data.delta;
+      if (activeTurnIndex >= 0) {
+        const turn = learningTurns[activeTurnIndex];
+        if (turn) turn.content += event.data.delta;
+      }
       scheduleMarkdownRender();
       return;
     case "source":
@@ -401,15 +477,18 @@ function handleResponseEvent(event: ResponseEvent) {
       return;
     case "completed":
       elements.resultStatus.className = "result-status complete";
-      elements.resultStatus.textContent = "Worked example";
+      elements.resultStatus.textContent = "Ready";
+      activeTurnIndex = -1;
       setBusy(false);
       return;
     case "cancelled":
+      discardEmptyActiveTurn();
       elements.resultStatus.className = "result-status";
       elements.resultStatus.textContent = "Stopped";
       setBusy(false);
       return;
     case "failed":
+      discardEmptyActiveTurn();
       showResultError(event.data.message);
       setBusy(false);
   }
@@ -422,7 +501,7 @@ function scheduleMarkdownRender() {
     renderQueued = false;
     const distanceFromBottom =
       elements.result.scrollHeight - elements.result.scrollTop - elements.result.clientHeight;
-    elements.markdown.innerHTML = renderMarkdown(output);
+    elements.markdown.replaceChildren(renderLearningTurns(learningTurns));
     secureRenderedLinks(elements.markdown);
     if (distanceFromBottom < 80) {
       elements.result.scrollTop = elements.result.scrollHeight;
@@ -430,8 +509,68 @@ function scheduleMarkdownRender() {
   });
 }
 
+function prepareDetail(mode: "explain_step" | "check_attempt") {
+  if (busy || !targetProblem) return;
+  setComposerMode(mode);
+  if (mode === "explain_step") {
+    const selection = window.getSelection()?.toString().trim();
+    if (selection && selection.length <= 2_000) {
+      elements.prompt.value = selection;
+      elements.prompt.select();
+    }
+  }
+  elements.prompt.focus();
+}
+
+function startNewProblem() {
+  if (busy) return;
+  targetProblem = "";
+  sessionWebSearch = false;
+  activeTurnIndex = -1;
+  learningTurns.length = 0;
+  sourceMap.clear();
+  elements.markdown.replaceChildren();
+  elements.targetText.textContent = "";
+  elements.targetMessage.classList.add("hidden");
+  elements.sourceList.replaceChildren();
+  elements.sources.classList.add("hidden");
+  elements.resultStatus.classList.add("hidden");
+  elements.markdown.classList.add("hidden");
+  elements.emptyState.classList.remove("hidden");
+  elements.result.classList.add("empty");
+  setComposerMode("new_problem");
+  elements.prompt.focus();
+}
+
+function discardEmptyActiveTurn() {
+  if (activeTurnIndex >= 0 && !learningTurns[activeTurnIndex]?.content.trim()) {
+    learningTurns.splice(activeTurnIndex, 1);
+    elements.markdown.replaceChildren(renderLearningTurns(learningTurns));
+  }
+  activeTurnIndex = -1;
+}
+
+function statusForAction(action: LearningAction): string {
+  switch (action) {
+    case "initial":
+      return "Building your example...";
+    case "another_hint":
+      return "Finding the next hint...";
+    case "explain_step":
+      return "Explaining that step...";
+    case "check_attempt":
+      return "Checking your attempt...";
+    case "reveal_solution":
+      return "Working the target solution...";
+  }
+}
+
 function renderSources() {
-  if (sourceMap.size === 0) return;
+  if (sourceMap.size === 0) {
+    elements.sourceList.replaceChildren();
+    elements.sources.classList.add("hidden");
+    return;
+  }
   elements.sourceList.replaceChildren(
     ...Array.from(sourceMap, ([url, title]) => {
       const item = document.createElement("li");
@@ -468,9 +607,78 @@ function openExternalLink(event: MouseEvent) {
 
 function setBusy(value: boolean) {
   busy = value;
-  elements.generate.disabled = value;
-  elements.stop.classList.toggle("hidden", !value);
-  elements.prompt.disabled = value;
+  if (!value) {
+    if (learningTurns.some((turn) => turn.content.trim())) {
+      composerMode = "idle";
+    } else {
+      elements.prompt.value = targetProblem;
+      targetProblem = "";
+      composerMode = "new_problem";
+    }
+  }
+  updateComposerUI();
+  renderLearningActions();
+}
+
+function setComposerMode(mode: ComposerMode) {
+  if (busy) return;
+  composerMode = mode;
+  if (mode === "new_problem" || mode === "idle") {
+    elements.prompt.value = "";
+  }
+  updateComposerUI();
+  renderLearningActions();
+}
+
+function updateComposerUI() {
+  const configs: Record<ComposerMode, { placeholder: string; button: string }> = {
+    new_problem: {
+      placeholder: "Ask for guidance and a worked example...",
+      button: "Work it out",
+    },
+    idle: {
+      placeholder: "Choose a learning action below, or start a new problem.",
+      button: "Send",
+    },
+    explain_step: {
+      placeholder: "Paste or describe the step you want explained...",
+      button: "Explain step",
+    },
+    check_attempt: {
+      placeholder: "Enter your answer or working so far...",
+      button: "Check attempt",
+    },
+  };
+  const config = configs[composerMode];
+  const acceptsInput = composerMode !== "idle" && !busy;
+  const collectingDetail = composerMode === "explain_step" || composerMode === "check_attempt";
+
+  elements.prompt.placeholder = config.placeholder;
+  elements.prompt.disabled = !acceptsInput;
+  elements.generate.textContent = config.button;
+  elements.generate.disabled = !acceptsInput;
+  elements.generate.classList.toggle("hidden", composerMode === "idle");
+  elements.stop.textContent = busy ? "Stop" : "Cancel";
+  elements.stop.classList.toggle("hidden", !busy && !collectingDetail);
+  elements.searchOption.classList.toggle("hidden", composerMode !== "new_problem" || busy);
+  elements.capabilityNote.classList.toggle("hidden", composerMode !== "new_problem" || busy);
+}
+
+function renderLearningActions() {
+  const hasCompletedTurn = learningTurns.some((turn) => turn.content.trim());
+  const revealed = learningTurns.some(
+    (turn) => turn.action === "reveal_solution" && turn.content.trim(),
+  );
+  elements.learningActions.classList.toggle("hidden", !hasCompletedTurn || busy);
+  elements.anotherHint.classList.toggle("hidden", revealed);
+  elements.checkAttempt.classList.toggle("hidden", revealed);
+  elements.revealSolution.classList.toggle("hidden", revealed);
+
+  const actionDisabled = composerMode !== "idle";
+  elements.anotherHint.disabled = actionDisabled;
+  elements.explainStep.disabled = actionDisabled;
+  elements.checkAttempt.disabled = actionDisabled;
+  elements.revealSolution.disabled = actionDisabled;
 }
 
 function showResultError(message: string) {

@@ -19,8 +19,33 @@ The first usable slice contains one primary screen:
 - Stop an in-progress response.
 - Follow source links supplied by the model.
 
-Conversation history, attachments, accounts shared between machines, automatic
+Persistent conversation history, attachments, accounts shared between machines, automatic
 updates, and a provider marketplace are deliberately out of scope.
+
+## Interactive Learning Milestone
+
+The next milestone turns the one-shot document into a small learning session.
+One target problem remains active while the learner asks for progressively more
+help. Each response is appended as a labeled turn rather than replacing prior
+guidance.
+
+After the initial guidance and analogous worked example, the learner can:
+
+- Request another hint that advances without revealing the target result.
+- Select or describe a step and ask for a focused explanation.
+- Submit an attempted answer or working and receive feedback on the first useful
+  correction, without receiving the target answer.
+- Explicitly request the complete target solution when they choose to reveal it.
+- Clear the session and begin a new target problem.
+
+The composer remains the only text input. Choosing **Explain a step** or
+**Check my attempt** temporarily changes its purpose, placeholder, and submit
+label. Enter submits and Shift+Enter inserts a newline.
+
+The backend remains stateless between calls. For each follow-up, the frontend
+sends the original target, prior assistant turns, the selected action, and only
+the learner detail needed for that action. Provider-specific adapters still
+receive one normalized learning request.
 
 ## Technical Shape
 
@@ -135,6 +160,22 @@ output remains useful while streaming.
 - Model output is sanitized before rendering.
 - Automated tests cover protocol parsing and security-sensitive pure logic.
 - The project produces a Windows release build.
+
+### Interactive Learning
+
+- Initial generation does not reveal the target result and includes a solved
+  analogous example.
+- Another hint appends a new turn and preserves the previous explanation.
+- Explain-a-step accepts a learner-selected or typed step and appends a focused
+  explanation.
+- Attempt feedback identifies what is correct and the next correction without
+  completing the target problem.
+- Revealing the target solution requires a distinct explicit action.
+- Starting a new problem clears prior turns only after the learner chooses it.
+- Follow-up generation remains cancellable and the action controls recover
+  after errors or cancellation.
+- Long sessions remain inside the independently scrollable answer panel and
+  follow new output only while the reader is already near the bottom.
 
 ## Known Vertical-Slice Risks
 

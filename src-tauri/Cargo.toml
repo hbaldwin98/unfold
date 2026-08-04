@@ -1,6 +1,6 @@
 [package]
 name = "worked-examples"
-version = "0.1.2"
+version = "0.2.0"
 description = "A focused desktop app for step-by-step worked examples"
 authors = ["Worked Examples contributors"]
 edition = "2024"
