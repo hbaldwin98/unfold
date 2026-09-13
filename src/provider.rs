@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Response, redirect};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tauri::ipc::Channel;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -127,16 +127,11 @@ struct CompatibleModel {
 pub async fn generate(
     settings: Settings,
     request: GenerateRequest,
-    on_event: Channel<ResponseEvent>,
+    on_event: UnboundedSender<ResponseEvent>,
     cancellation: CancellationToken,
 ) -> Result<(), String> {
     let prompt = learning_prompt(&request)?;
-    if request.web_search
-        && settings.provider == Provider::Compatible
-        && settings.protocol == Protocol::ChatCompletions
-    {
-        return Err("Web search is unavailable with Chat Completions".to_owned());
-    }
+    validate_search_support(&settings, request.web_search)?;
 
     let _ = on_event.send(ResponseEvent::Started);
     let response = send_request(&settings, &prompt, request.web_search).await?;
@@ -146,6 +141,17 @@ pub async fn generate(
         settings.protocol
     };
     stream_response(response, protocol, on_event, cancellation).await
+}
+
+fn validate_search_support(settings: &Settings, web_search: bool) -> Result<(), String> {
+    if web_search
+        && settings.provider == Provider::Compatible
+        && settings.protocol == Protocol::ChatCompletions
+    {
+        Err("Web search is unavailable with Chat Completions".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn list_models(settings: Settings) -> Result<Vec<ModelOption>, String> {
@@ -385,19 +391,21 @@ fn apply_reasoning(body: &mut Value, protocol: Protocol, effort: ReasoningEffort
     }
 }
 
-fn learning_prompt(request: &GenerateRequest) -> Result<String, String> {
-    let target = request.target.trim();
+fn validate_target(target: &str) -> Result<(), String> {
     if target.is_empty() {
         return Err("Enter a problem or topic first".to_owned());
     }
     if target.len() > 20_000 {
         return Err("The target problem is too long".to_owned());
     }
+    Ok(())
+}
+
+fn validate_session(request: &GenerateRequest) -> Result<(), String> {
     if request.previous_turns.len() > 20 {
         return Err("This learning session has too many turns".to_owned());
     }
-
-    let prior_length = request
+    let length = request
         .previous_turns
         .iter()
         .map(|turn| {
@@ -410,9 +418,13 @@ fn learning_prompt(request: &GenerateRequest) -> Result<String, String> {
                     .unwrap_or_default()
         })
         .sum::<usize>();
-    if prior_length > 80_000 {
+    if length > 80_000 {
         return Err("This learning session is too long; start a new problem".to_owned());
     }
+    Ok(())
+}
+
+fn validate_action(request: &GenerateRequest) -> Result<(), String> {
     if request.mode == LearningMode::WorkedExample
         && !matches!(
             request.action,
@@ -424,29 +436,34 @@ fn learning_prompt(request: &GenerateRequest) -> Result<String, String> {
     if request.mode == LearningMode::Socratic && request.action == LearningAction::FollowUp {
         return Err("Use a Socratic response for this learning session".to_owned());
     }
+    Ok(())
+}
 
-    let detail = request.detail.as_deref().map(str::trim).unwrap_or_default();
-    if matches!(
-        request.action,
-        LearningAction::SocraticResponse
-            | LearningAction::FollowUp
-            | LearningAction::ExplainTerm
-            | LearningAction::ExplainStep
-            | LearningAction::CheckAttempt
-    ) && detail.is_empty()
-    {
-        return Err(match request.action {
-            LearningAction::SocraticResponse => "Answer the question before responding".to_owned(),
-            LearningAction::FollowUp => "Enter a question about the worked example".to_owned(),
-            LearningAction::ExplainTerm => "Choose a term to explain".to_owned(),
-            LearningAction::ExplainStep => "Describe or select the step to explain".to_owned(),
-            LearningAction::CheckAttempt => "Enter your attempt before checking it".to_owned(),
-            _ => unreachable!(),
-        });
-    }
+fn validate_detail(action: LearningAction, detail: &str) -> Result<(), String> {
     if detail.len() > 20_000 {
         return Err("The learner detail is too long".to_owned());
     }
+    if !detail.is_empty() {
+        return Ok(());
+    }
+    let message = match action {
+        LearningAction::SocraticResponse => Some("Answer the question before responding"),
+        LearningAction::FollowUp => Some("Enter a question about the worked example"),
+        LearningAction::ExplainTerm => Some("Choose a term to explain"),
+        LearningAction::ExplainStep => Some("Describe or select the step to explain"),
+        LearningAction::CheckAttempt => Some("Enter your attempt before checking it"),
+        _ => None,
+    };
+    message.map_or(Ok(()), |value| Err(value.to_owned()))
+}
+
+fn learning_prompt(request: &GenerateRequest) -> Result<String, String> {
+    let target = request.target.trim();
+    validate_target(target)?;
+    validate_session(request)?;
+    validate_action(request)?;
+    let detail = request.detail.as_deref().map(str::trim).unwrap_or_default();
+    validate_detail(request.action, detail)?;
 
     let action = match (request.mode, request.action) {
         (LearningMode::Socratic, LearningAction::Initial) => {
@@ -593,7 +610,7 @@ async fn checked(result: Result<Response, reqwest::Error>) -> Result<Response, S
 async fn stream_response(
     response: Response,
     protocol: Protocol,
-    on_event: Channel<ResponseEvent>,
+    on_event: UnboundedSender<ResponseEvent>,
     cancellation: CancellationToken,
 ) -> Result<(), String> {
     let mut stream = response.bytes_stream();
@@ -629,7 +646,7 @@ fn process_stream_chunk(
     state: &mut StreamState,
     chunk: Result<impl AsRef<[u8]>, reqwest::Error>,
     protocol: Protocol,
-    on_event: &Channel<ResponseEvent>,
+    on_event: &UnboundedSender<ResponseEvent>,
 ) -> Result<bool, String> {
     let chunk = chunk.map_err(|error| format!("The response stream failed: {error}"))?;
     let data = state.push(chunk.as_ref())?;
@@ -645,7 +662,7 @@ fn send_stream_events(
     sources: &mut HashSet<String>,
     data: Vec<String>,
     protocol: Protocol,
-    on_event: &Channel<ResponseEvent>,
+    on_event: &UnboundedSender<ResponseEvent>,
 ) -> bool {
     for item in data {
         if send_stream_data(sources, &item, protocol, on_event) {
@@ -697,7 +714,7 @@ fn send_stream_data(
     sources: &mut HashSet<String>,
     data: &str,
     protocol: Protocol,
-    on_event: &Channel<ResponseEvent>,
+    on_event: &UnboundedSender<ResponseEvent>,
 ) -> bool {
     if data == "[DONE]" {
         let _ = on_event.send(ResponseEvent::Completed);
@@ -814,6 +831,27 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recursively_collects_only_http_sources() {
+        let value = serde_json::json!({
+            "items": [
+                {"url": "https://example.test/a", "title": "A"},
+                {"nested": {"url": "http://example.test/b"}},
+                {"url": "file:///private"},
+                "text"
+            ]
+        });
+        let mut events = Vec::new();
+        collect_sources(&value, &mut events);
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], ResponseEvent::Source { title, url } if title == "A" && url.ends_with("/a"))
+        );
+        assert!(
+            matches!(&events[1], ResponseEvent::Source { title, url } if title == url && url.ends_with("/b"))
+        );
+    }
 
     #[test]
     fn stream_state_reassembles_events_across_chunks() {

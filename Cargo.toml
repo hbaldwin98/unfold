@@ -1,31 +1,26 @@
 [package]
 name = "unfold"
 version = "0.3.0"
-description = "A focused desktop app for guided learning"
+description = "A focused terminal app for guided learning"
 authors = ["Unfold contributors"]
 edition = "2024"
 license = "MIT"
 
-[lib]
-name = "unfold_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dependencies]
 base64 = "0.22"
+crossterm = "0.29"
+directories = "6"
 futures-util = "0.3"
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+open = "5"
 rand = "0.9"
+ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 socket2 = "0.6"
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 url = "2"
 uuid = { version = "1", features = ["v4"] }

@@ -1,278 +1,47 @@
 # Unfold Product Plan
 
-## Purpose
+## Product
 
-Build a focused desktop application that helps a learner understand a question
-through either guided inquiry or a complete worked solution. The selected
-pedagogy determines whether the target answer is withheld or demonstrated, and
-sources are cited when web search is used.
+Unfold is one Rust binary with an immediate-mode Ratatui interface. A learner enters one target problem, fixes either Socratic or Worked Example mode for that in-memory session, and receives a streamed response. Follow-up turns retain prior visible assistant output and learner detail.
 
-## Product Slice
+Socratic sessions support free-form answers, another hint, a focused step explanation, attempt checking, and an explicit solution reveal. Worked Example sessions produce a complete solution and accept free-form questions afterward. Web search is optional and is unavailable for Chat Completions.
 
-The first usable slice contains one primary screen:
+The terminal has one event owner. Provider and OAuth tasks report through Tokio channels; generation IDs reject stale events. `CancellationToken` stops active streams. Ratatui initialization and restoration cover normal and returned-error paths.
 
-- Choose ChatGPT or an OpenAI-compatible endpoint.
-- Sign in to ChatGPT in the system browser, or configure an endpoint and API key.
-- Enter a problem or topic.
-- Optionally request web search when the selected provider supports it.
-- Stream a Markdown response with readable mathematics.
-- Stop an in-progress response.
-- Follow source links supplied by the model.
+## Architecture
 
-Persistent conversation history, attachments, accounts shared between machines, automatic
-updates, and a provider marketplace are deliberately out of scope.
+- Root binary crate in `src/`
+- `main.rs`: event loop, state, key routing, rendering, and service orchestration
+- `provider.rs`: request construction, model catalogs, bounded SSE parsing, and normalized `ResponseEvent`
+- `auth.rs`: ChatGPT PKCE login, callback, token exchange, and refresh
+- `secrets.rs`: Windows-native keyring storage using service `com.workedexamples.desktop`
+- `settings.rs`: validated non-secret configuration and legacy Tauri settings fallback
+- `learning.rs`: prior-turn projection and untrusted terminal-text sanitization
 
-## Interactive Learning Milestone
+No Node, browser frontend, WebView, Tauri command, installer, or transcript database remains.
 
-The next milestone turns the one-shot document into a small learning session.
-One target problem remains active while the learner asks for progressively more
-help. Each response is appended as a labeled turn rather than replacing prior
-guidance.
+## Security Boundaries
 
-After the initial guidance and analogous worked example, the learner can:
+- Non-loopback endpoints must use HTTPS.
+- Provider and auth clients reject redirects and enforce timeouts.
+- Catalogs, provider errors, SSE lines, and complete streams have byte limits.
+- Credentials never enter settings or transcript state.
+- Model reasoning event families, reasoning tags, suggestion markers, and term markers are hidden.
+- ANSI/OSC and C0/C1 terminal controls are removed from provider-controlled display text.
+- Browser authorization uses the `open` crate rather than interpolated shell commands.
 
-- Request another hint that advances without revealing the target result.
-- Select or describe a step and ask for a focused explanation.
-- Submit an attempted answer or working and receive feedback on the first useful
-  correction, without receiving the target answer.
-- Explicitly request the complete target solution when they choose to reveal it.
-- Clear the session and begin a new target problem.
+## Acceptance
 
-The composer remains the only text input. Choosing **Explain a step** or
-**Check my attempt** temporarily changes its purpose, placeholder, and submit
-label. Enter submits and Shift+Enter inserts a newline.
+- The release binary starts in an actionable problem-input state.
+- All learning modes/actions, settings, auth, catalog refresh, cancellation, scrolling, new problem, help, and quit are keyboard reachable.
+- Responses stream while the terminal remains responsive.
+- Previous turns are supplied without hidden metadata or controls.
+- Terminal state is restored after normal exit and recoverable errors.
+- `fmt`, tests, warning-denying Clippy, locked release build, `cargo audit`, and whitespace checks pass in root CI.
 
-The backend remains stateless between calls. For each follow-up, the frontend
-sends the original target, prior assistant turns, the selected action, and only
-the learner detail needed for that action. Provider-specific adapters still
-receive one normalized learning request.
+## Limits
 
-## Learning Modes
-
-The learner chooses a mode before starting a new problem. The selected mode is
-fixed for that in-memory session and remembered locally for the next session.
-
-### Socratic
-
-Socratic mode is a question-and-response dialogue. The initial turn asks one
-purposeful question chosen to expose the learner's current understanding or the
-next useful distinction. The learner answers in the bottom composer; the next
-turn briefly tests that reasoning and asks exactly one further question. It does
-not provide a worked analogy, a step list, or an unsolicited explanation.
-
-Each Socratic question may also include two or three short, context-specific next
-moves generated by the model. They concretely name a relevant concept,
-relationship, representation, or single operation, but stop before carrying it
-out or stating a resulting value. They appear as optional buttons and are never
-marked as correct. Selecting one submits it as the learner's response; free-form
-input always remains available. Missing or malformed suggestions do not block
-the dialogue and are never rendered as model-output artifacts.
-
-The learner can request one minimal guiding hint, ask for a focused explanation,
-or submit work for explicit checking. Those actions still end by returning the
-reasoning to the learner. Only the explicit **Reveal solution** action authorizes
-a complete target solution.
-
-### Worked Example
-
-Worked Example mode is complete in one shot. Its initial turn completely
-solves the submitted target as the example being studied. It includes the
-necessary ingredients, numbered steps with reasons, a clearly identified final
-answer, and an independent check. It must be self-contained and must not defer
-essential work to a follow-up. Afterward, the composer remains available for
-optional questions about that solution, but no follow-up is required to obtain
-the complete explanation.
-
-Provider requests carry a typed learning mode in addition to the typed action.
-The Rust boundary distinguishes Worked Example questions from Socratic actions
-so provider prompting and UI behavior cannot disagree about solution disclosure.
-
-## Model And Reasoning Controls
-
-Model selection is discovery-backed but remains custom-capable. For a signed-in
-ChatGPT account, the backend loads the account-visible Codex model catalog and
-uses its display names, ordering, default model, and supported reasoning levels.
-For a saved compatible endpoint, it loads `/v1/models`; a manually entered model
-ID remains available when discovery is unsupported or fails.
-
-Reasoning effort is a persisted non-secret setting. The UI offers the selected
-model's advertised levels when available and protocol-compatible fallback levels
-otherwise. `default` omits the request control; explicit levels are sent as
-`reasoning.effort` for Responses and `reasoning_effort` for Chat Completions.
-
-Reasoning summaries and raw reasoning are never part of the learning transcript.
-The backend discards Responses reasoning event families, Chat Completions reads
-only normal content deltas, and the renderer removes complete or partially
-streamed `<think>`, `<analysis>`, and `<reasoning>` blocks from compatible models.
-
-## Contextual Terms
-
-The model marks up to five first-use technical terms with a narrow inline marker.
-The sanitized Markdown renderer turns each marker into a subdued, keyboard-
-accessible term button. Selecting one opens an ephemeral side-note request with
-the active target and prior turns as context; its streamed explanation never
-enters the main transcript or future model context. Socratic explanations define
-the term without completing the target and return one understanding check;
-Worked Example explanations may refer to the already revealed solution. Invalid
-marker syntax remains harmless text and cannot execute HTML.
-
-## Technical Shape
-
-- Tauri 2 desktop shell.
-- Rust backend for OAuth, credentials, provider requests, and streaming.
-- Plain TypeScript frontend rendered by the operating system WebView.
-- Marked, DOMPurify, and KaTeX for safe Markdown and mathematics.
-- Windows Credential Manager through `keyring-rs` for all secrets.
-- A small JSON settings file for non-secret preferences.
-
-The frontend never receives refresh tokens or API keys. It receives only account
-status, non-secret settings, response events, and user-displayable errors.
-
-## Provider Boundary
-
-Both provider implementations produce the same application events:
-
-1. `started`
-2. zero or more `text_delta` events
-3. zero or more `source` events
-4. exactly one `completed`, `cancelled`, or `failed` event
-
-### ChatGPT
-
-ChatGPT integration follows the browser authorization flow used by Codex-capable
-clients without installing or bundling Codex:
-
-1. Generate a PKCE verifier/challenge and cryptographically random state.
-2. Listen on `http://localhost:1455/auth/callback`.
-3. Open the authorization URL at `https://auth.openai.com/oauth/authorize`.
-4. Validate the callback state and exchange the code at `/oauth/token`.
-5. Store the access token, refresh token, expiry, and account ID in Windows
-   Credential Manager.
-6. Refresh expired access tokens with the refresh token.
-7. Send Responses requests to
-   `https://chatgpt.com/backend-api/codex/responses` with bearer and
-   `ChatGPT-Account-Id` headers.
-
-This ChatGPT responses endpoint is not the public OpenAI Platform API. It can
-change independently, so all endpoint-specific request and event translation
-stays inside one adapter. Authentication failures clear unusable credentials
-and return the user to a recoverable signed-out state.
-
-### OpenAI-Compatible Endpoint
-
-The endpoint adapter stores a base URL, model, and protocol preference. Secrets
-remain in Credential Manager.
-
-- `Responses` mode uses `/v1/responses`, supports streaming, and may enable the
-  built-in `web_search` tool.
-- `Chat Completions` mode uses `/v1/chat/completions` and does not claim web
-  search support.
-- The UI disables search when the configured protocol cannot provide it.
-
-Compatibility means request-shape compatibility only. It does not imply that a
-server supports OpenAI models, Responses, tools, citations, or identical event
-types.
-
-## Response Contract
-
-Every Socratic initial request asks for exactly one concise diagnostic or
-forward-moving question. Each learner response request asks for brief feedback
-on the reasoning followed by exactly one next question. It must not provide a
-worked analogy, a solution outline, multiple questions, or the target answer.
-Sources are included for factual claims when search is enabled.
-
-Every Worked Example initial request asks for:
-
-1. A concise restatement of the submitted problem.
-2. The concepts, formulas, facts, or other necessary ingredients.
-3. A complete numbered solution to the submitted problem with a reason for each
-   meaningful step.
-4. A clearly identified final answer.
-5. An independent substitution, estimate, inverse operation, or other check.
-6. Sources for factual claims when search is enabled.
-
-The vertical slice uses Markdown rather than a rigid JSON schema so partial
-output remains useful while streaming.
-
-## Security Rules
-
-- Use OAuth Authorization Code with PKCE and validate `state` exactly.
-- Bind the callback server only to localhost and stop it after success, failure,
-  cancellation, or timeout.
-- Never log authorization codes, access tokens, refresh tokens, or API keys.
-- Store secrets only in Windows Credential Manager.
-- Sanitize model-produced HTML before inserting it into the WebView.
-- Permit only `http` and `https` links from rendered model output.
-- Keep Tauri commands narrow; do not expose a general HTTP or shell command.
-
-## Implementation Order
-
-1. Scaffold Tauri, TypeScript, and test infrastructure.
-2. Implement settings and secure credential storage.
-3. Implement provider-neutral request/event types.
-4. Implement OpenAI-compatible Responses and Chat Completions streaming.
-5. Implement ChatGPT PKCE login, refresh, logout, and responses streaming.
-6. Build the single-screen interface and safe Markdown/math rendering.
-7. Add unit tests for OAuth state, JWT claims, SSE parsing, provider request
-   construction, and settings validation.
-8. Verify frontend tests, Rust tests, development startup, and a release build.
-9. Document setup, usage, and known limitations.
-
-## Acceptance Criteria
-
-- A user can launch the app and see an actionable signed-out/configuration state.
-- ChatGPT login opens the default browser and returns to a signed-in app.
-- Restarting the app reuses securely stored credentials and refreshes them when
-  necessary.
-- A compatible endpoint can be configured without exposing its key to the
-  frontend after storage.
-- A prompt streams into target guidance and a readable solved analogous example.
-- Long input and output remain inside independently scrollable application panels.
-- Search is available only for a provider/protocol that advertises support.
-- Available models can be loaded from the saved provider while custom model IDs
-  remain usable when discovery is unavailable.
-- Reasoning effort is configurable and persisted without displaying reasoning
-  summaries, raw chain-of-thought events, or compatible-provider thinking tags.
-- Marked unfamiliar terms are clickable and open a contextual side note without
-  adding noise to the main transcript or changing answer-disclosure rules.
-- Stop cancels the active network request and leaves the UI usable.
-- Invalid credentials, occupied callback ports, malformed events, network
-  failures, and unsupported endpoint behavior produce recoverable errors.
-- Model output is sanitized before rendering.
-- Automated tests cover protocol parsing and security-sensitive pure logic.
-- The project produces a Windows release build.
-
-### Interactive Learning
-
-- Socratic initial generation asks exactly one purposeful question without a
-  worked analogy, solution outline, or target result.
-- A learner can answer that question in the composer; the response is retained
-  as context and the model asks exactly one next question.
-- Valid AI-generated response suggestions appear as clickable plain-text
-  options; malformed suggestion metadata is ignored without affecting the turn.
-- Worked Example initial generation completely solves and checks the submitted
-  target in one self-contained response.
-- Worked Example mode accepts optional conversational questions after its
-  complete initial response without requiring them.
-- The selected learning mode is visible, remembered locally, and cannot change
-  while a target session is active.
-- Another hint appends a new turn and preserves the previous explanation.
-- Explain-a-step accepts a learner-selected or typed step and appends a focused
-  explanation.
-- Attempt feedback identifies what is correct and the next correction without
-  completing the target problem.
-- Revealing the target solution requires a distinct explicit action.
-- Socratic follow-up controls are not offered or accepted for a one-shot Worked
-  Example session.
-- Starting a new problem clears prior turns only after the learner chooses it.
-- Follow-up generation remains cancellable and the action controls recover
-  after errors or cancellation.
-- Long sessions remain inside the independently scrollable answer panel and
-  follow new output only while the reader is already near the bottom.
-
-## Known Vertical-Slice Risks
-
-- The ChatGPT Codex responses backend is not a stable public API and may change.
-- ChatGPT subscription plans and workspace policy determine model availability.
-- An OpenAI-compatible endpoint may implement only a subset of either protocol.
-- Tauri requires Microsoft C++ Build Tools and WebView2 on Windows.
+- Markdown and mathematics are displayed as plain terminal text.
+- Source URLs are displayed but are not interactive.
+- The model catalog is shown in the status text; custom model IDs are entered in Settings.
+- Sessions are intentionally memory-only.

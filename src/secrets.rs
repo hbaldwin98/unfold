@@ -35,12 +35,11 @@ fn entry(account: &str) -> Result<Entry, String> {
 }
 
 pub fn load_oauth() -> Result<Option<OAuthCredentials>, String> {
-    let manifest = match entry(CHATGPT_MANIFEST)?.get_password() {
-        Ok(value) => serde_json::from_str::<OAuthManifest>(&value)
-            .map_err(|_| "Stored ChatGPT credentials are invalid".to_owned())?,
-        Err(Error::NoEntry) => return Ok(None),
-        Err(error) => return Err(format!("Could not read ChatGPT credentials: {error}")),
+    let Some(value) = manifest_password()? else {
+        return Ok(None);
     };
+    let manifest = serde_json::from_str::<OAuthManifest>(&value)
+        .map_err(|_| "Stored ChatGPT credentials are invalid".to_owned())?;
     Ok(Some(OAuthCredentials {
         access_token: read_chunks(&manifest.generation, "access", manifest.access_chunks)?,
         refresh_token: read_chunks(&manifest.generation, "refresh", manifest.refresh_chunks)?,
@@ -86,10 +85,7 @@ pub fn save_oauth(credentials: &OAuthCredentials) -> Result<(), String> {
 
 pub fn delete_oauth() -> Result<(), String> {
     let manifest = load_manifest()?;
-    match entry(CHATGPT_MANIFEST)?.delete_credential() {
-        Ok(()) | Err(Error::NoEntry) => Ok(()),
-        Err(error) => Err(format!("Could not remove ChatGPT credentials: {error}")),
-    }?;
+    delete_manifest()?;
     if let Some(manifest) = manifest {
         delete_generation(
             &manifest.generation,
@@ -100,11 +96,24 @@ pub fn delete_oauth() -> Result<(), String> {
     Ok(())
 }
 
+fn delete_manifest() -> Result<(), String> {
+    match entry(CHATGPT_MANIFEST)?.delete_credential() {
+        Ok(()) | Err(Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Could not remove ChatGPT credentials: {error}")),
+    }
+}
+
 fn load_manifest() -> Result<Option<OAuthManifest>, String> {
-    match entry(CHATGPT_MANIFEST)?.get_password() {
-        Ok(value) => serde_json::from_str(&value)
+    manifest_password()?.map_or(Ok(None), |value| {
+        serde_json::from_str(&value)
             .map(Some)
-            .map_err(|_| "Stored ChatGPT credentials are invalid".to_owned()),
+            .map_err(|_| "Stored ChatGPT credentials are invalid".to_owned())
+    })
+}
+
+fn manifest_password() -> Result<Option<String>, String> {
+    match entry(CHATGPT_MANIFEST)?.get_password() {
+        Ok(value) => Ok(Some(value)),
         Err(Error::NoEntry) => Ok(None),
         Err(error) => Err(format!("Could not read ChatGPT credentials: {error}")),
     }
@@ -160,14 +169,6 @@ fn delete_generation(generation: &str, access_chunks: usize, refresh_chunks: usi
             };
             let _ = entry.delete_credential();
         }
-    }
-}
-
-pub fn has_api_key() -> Result<bool, String> {
-    match entry(COMPATIBLE_ACCOUNT)?.get_password() {
-        Ok(_) => Ok(true),
-        Err(Error::NoEntry) => Ok(false),
-        Err(error) => Err(format!("Could not read the endpoint credential: {error}")),
     }
 }
 

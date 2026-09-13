@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,18 +102,23 @@ fn is_loopback(url: &url::Url) -> bool {
     }
 }
 
-fn path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_config_dir()
-        .map(|directory| directory.join("settings.json"))
-        .map_err(|error| format!("Could not locate the settings directory: {error}"))
+fn path() -> Result<PathBuf, String> {
+    ProjectDirs::from("com", "workedexamples", "desktop")
+        .map(|dirs| dirs.config_dir().join("settings.json"))
+        .ok_or_else(|| "Could not locate the settings directory".to_owned())
 }
 
-pub fn load(app: &AppHandle) -> Result<Settings, String> {
-    let path = path(app)?;
-    if !path.exists() {
+fn legacy_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(PathBuf::from).map(|path| {
+        path.join("com.workedexamples.desktop")
+            .join("settings.json")
+    })
+}
+
+pub fn load() -> Result<Settings, String> {
+    let Some(path) = existing_path(path()?, legacy_path()) else {
         return Ok(Settings::default());
-    }
+    };
 
     let contents =
         fs::read_to_string(path).map_err(|error| format!("Could not read settings: {error}"))?;
@@ -123,9 +128,21 @@ pub fn load(app: &AppHandle) -> Result<Settings, String> {
     Ok(settings)
 }
 
-pub fn save(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+fn existing_path(current: PathBuf, legacy: Option<PathBuf>) -> Option<PathBuf> {
+    if current.exists() {
+        Some(current)
+    } else {
+        legacy.filter(|path| path.exists())
+    }
+}
+
+pub fn save(settings: &Settings) -> Result<(), String> {
     settings.validate()?;
-    let path = path(app)?;
+    let path = path()?;
+    save_to_path(settings, &path)
+}
+
+fn save_to_path(settings: &Settings, path: &std::path::Path) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Settings path has no parent directory".to_owned())?;

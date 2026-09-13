@@ -1,142 +1,60 @@
 # Unfold
 
-A focused Windows desktop application with two ways to learn: guided Socratic
-practice or a complete, one-shot worked solution.
+Unfold is a keyboard-only Rust terminal application for guided Socratic practice and complete worked examples. It streams responses from ChatGPT subscription access or an OpenAI-compatible endpoint.
 
-The app supports:
+## Build And Run
 
-- ChatGPT subscription access through browser authorization.
-- OpenAI-compatible Responses and Chat Completions endpoints.
-- Account/provider model discovery with custom model IDs as a fallback.
-- Configurable reasoning effort with reasoning summaries and thinking blocks
-  excluded from the transcript.
-- Clickable first-use technical terms that stream an instant contextual side
-  note without cluttering the main lesson transcript.
-- Optional provider-native web search.
-- Streaming Markdown with KaTeX mathematics.
-- Source links, cancellation, and responsive desktop/mobile-width layouts.
-- A bounded application viewport with independently scrolling input and output.
-- Socratic dialogue that asks one purposeful question at a time and carries the
-  learner's responses into the next turn.
-- Optional AI-generated next moves for each Socratic question: concrete enough
-  to name a useful concept or operation, but stopped before calculations or
-  answers and always accompanied by free-form responses.
-- Focused step explanations and feedback on the learner's attempt.
-- An explicit target-solution reveal rather than an automatic answer.
-- One-shot Worked Example mode with ingredients, numbered reasoning, a final
-  answer, and an independent check.
-
-See [PLAN.md](PLAN.md) for the architecture, security rules, scope, and
-acceptance criteria for this vertical slice.
-
-## Use The App
-
-1. Open **Unfold**.
-2. Select the connection button in the upper-right corner.
-3. Choose a provider.
-4. Save the connection.
-5. Reopen **Connection** to select from models returned by the saved provider
-   and choose a supported reasoning effort. Custom model IDs remain valid.
-6. Choose **Socratic** for guided practice or **Worked example** for a complete
-   solution in one response. The app remembers this choice.
-7. Enter a problem and submit it.
-8. In Socratic mode, answer each question in the composer or use **Give me a
-   hint**, **Explain a step**, or **Check my attempt**. Use **Show solution** only
-   when you intentionally want the target answer.
-9. In Worked Example mode, optionally use the composer afterward to ask about
-   any step, assumption, or alternative method.
-
-The active learning session is kept in memory while the app is open. Select
-**New problem** to clear its turns and begin again; persistent session history
-is not part of this milestone.
-
-### ChatGPT
-
-Select **Sign in**. The app opens OpenAI authorization in the default browser
-and listens for the callback on `http://localhost:1455/auth/callback`.
-
-The app uses OAuth Authorization Code with PKCE. Access and refresh tokens are
-split across size-bounded entries in Windows Credential Manager and are never
-sent to the frontend. The app refreshes an expired access token automatically.
-
-No Codex executable is installed, bundled, or launched.
-
-### Compatible Endpoint
-
-Configure:
-
-- **Responses** for `/v1/responses`, streaming, and optional provider-native
-  `web_search`.
-- **Chat Completions** for `/v1/chat/completions` and streaming text without a
-  claimed search capability.
-- A base URL, model identifier, and optional API key.
-
-The API key is stored in Windows Credential Manager. To remove a stored key,
-enter `CLEAR` in the API key field and save.
-
-An OpenAI-compatible endpoint may implement only part of either protocol. The
-app reports unsupported request shapes and events as provider errors.
-
-## Development
-
-Prerequisites:
-
-- Node.js 20 or newer.
-- Rust with the `x86_64-pc-windows-msvc` toolchain.
-- Microsoft C++ Build Tools.
-- WebView2 Runtime.
-
-Install and run:
+Prerequisites are a current stable Rust toolchain and, on Windows, Microsoft C++ Build Tools.
 
 ```powershell
-npm install
-npm run tauri dev
+cargo run --release
 ```
 
-Run verification:
+Non-secret settings are stored in the operating system configuration directory. Existing Tauri settings under `%APPDATA%\com.workedexamples.desktop\settings.json` are read when present. OAuth credentials and compatible-provider API keys remain in Windows Credential Manager under `com.workedexamples.desktop`. Sessions and transcripts stay in memory and are never persisted.
+
+## Keys
+
+- `Enter`: start a problem or submit a free-form response/follow-up
+- `F1`: help
+- `F2`: switch Socratic/Worked Example mode before starting
+- `F3`: toggle provider web search
+- `F4`: edit provider, protocol, URL, model, reasoning, and API key
+- `F5`: another Socratic hint
+- `F6` / `F7`: ChatGPT browser login / logout
+- `F8`: refresh and display the provider model catalog
+- `F9`: explain the step typed in the input
+- `F10`: check the attempt typed in the input
+- `F12`: reveal the Socratic solution
+- `Esc`: cancel generation
+- `PageUp` / `PageDown`: scroll the response
+- `Ctrl+N`: clear the in-memory session and start a new problem
+- `Ctrl+Q`: quit
+
+In Settings, use `Tab`/`Shift+Tab` to select a field, arrows to cycle choices, type to edit text fields, and `F2` to save. Enter `CLEAR` in the API key field to remove the stored key; an empty field leaves it unchanged.
+
+## Verification
 
 ```powershell
-npm test
-npm run build
-cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri build
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+cargo audit
+git diff --check
 ```
-
-Release artifacts are written to:
-
-- `src-tauri/target/release/unfold.exe`
-- `src-tauri/target/release/bundle/msi/Unfold_0.3.0_x64_en-US.msi`
-- `src-tauri/target/release/bundle/nsis/Unfold_0.3.0_x64-setup.exe`
 
 ## Security
 
-- OAuth callbacks are bound only to localhost, expire after five minutes, and
-  require an exact random `state` value.
-- Secrets are handled only by Rust and Windows Credential Manager.
-- Model-produced HTML is sanitized with DOMPurify.
-- Rendered links are restricted to HTTP and HTTPS and open in the system
-  browser.
-- The WebView has a restrictive Content Security Policy and cannot make model
-  provider requests directly.
-- The application exposes no general shell or arbitrary HTTP Tauri command.
+- Remote compatible endpoints require HTTPS; HTTP is accepted only on loopback.
+- HTTP clients reject redirects and enforce connect, request, error-body, catalog, SSE-event, and total-stream limits.
+- OAuth uses Authorization Code with PKCE, exact state validation, a five-minute localhost callback, and a safely launched browser URL without shell interpolation.
+- Provider text has ANSI, OSC, C0, and C1 terminal controls removed before display. Suggestion, term, and hidden-reasoning metadata is excluded from visible text and future turns.
+- Secrets stay in Windows Credential Manager. The app does not persist transcripts or log sensitive values.
 
-Non-local compatible endpoints must use HTTPS. Plain HTTP is accepted only for
-loopback development services such as `localhost`, `127.0.0.1`, and `::1`.
+ChatGPT mode uses the private Codex responses backend used by Codex-capable clients. It may change independently of the public OpenAI API.
 
 Report suspected vulnerabilities according to [SECURITY.md](SECURITY.md).
 
-## Stability Notice
-
-ChatGPT subscription mode sends authenticated requests to the ChatGPT Codex
-responses backend used by Codex-capable clients. This is not the public OpenAI
-Platform API and may change without the compatibility guarantees of the public
-Responses API. The implementation is intentionally isolated in
-`src-tauri/src/provider.rs` and `src-tauri/src/auth.rs`.
-
-Model availability depends on the signed-in subscription, workspace policy,
-and OpenAI's current Codex model catalog. If this integration changes, the
-OpenAI-compatible endpoint remains an independent provider path.
-
 ## License
 
-Unfold is available under the [MIT License](LICENSE).
+MIT. See [LICENSE](LICENSE).

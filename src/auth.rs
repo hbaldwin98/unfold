@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use tauri::{AppHandle, Emitter};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -52,7 +51,13 @@ pub fn status() -> Result<AuthStatus, String> {
     })
 }
 
-pub async fn start_login(app: AppHandle) -> Result<String, String> {
+pub async fn start_login() -> Result<
+    (
+        String,
+        tokio::sync::oneshot::Receiver<Result<AuthStatus, String>>,
+    ),
+    String,
+> {
     let listeners = bind_callback_listeners(1455)
         .map_err(|_| "Port 1455 is in use. Close another Codex login and try again.".to_owned())?;
 
@@ -76,16 +81,16 @@ pub async fn start_login(app: AppHandle) -> Result<String, String> {
     )
     .map_err(|error| format!("Could not create the authorization URL: {error}"))?;
 
-    tauri::async_runtime::spawn(async move {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
         let result = receive_callback(listeners, &state, &verifier).await;
-        let event = match result {
-            Ok(credentials) => serde_json::json!({ "success": true, "email": credentials.email }),
-            Err(error) => serde_json::json!({ "success": false, "error": error }),
-        };
-        let _ = app.emit("chatgpt-login-completed", event);
+        let _ = sender.send(result.map(|credentials| AuthStatus {
+            signed_in: true,
+            email: credentials.email,
+        }));
     });
 
-    Ok(auth_url.to_string())
+    Ok((auth_url.to_string(), receiver))
 }
 
 pub async fn valid_access_token() -> Result<(String, Option<String>), String> {
@@ -158,6 +163,15 @@ async fn receive_callback(
     expected_state: &str,
     verifier: &str,
 ) -> Result<OAuthCredentials, String> {
+    let mut stream = accept_callback(listeners).await?;
+    let request = read_callback(&mut stream).await?;
+    let result = process_callback(&request, expected_state, verifier).await;
+
+    write_callback_response(&mut stream, &result).await;
+    result
+}
+
+async fn accept_callback(listeners: CallbackListeners) -> Result<tokio::net::TcpStream, String> {
     let accept = async {
         match listeners.ipv6 {
             Some(ipv6) => {
@@ -169,16 +183,27 @@ async fn receive_callback(
             None => listeners.ipv4.accept().await,
         }
     };
-    let (mut stream, _) = timeout(Duration::from_secs(300), accept)
+    let (stream, _) = timeout(Duration::from_secs(300), accept)
         .await
         .map_err(|_| "ChatGPT login timed out".to_owned())?
         .map_err(|error| format!("Could not accept the login callback: {error}"))?;
+    Ok(stream)
+}
+
+async fn read_callback(stream: &mut tokio::net::TcpStream) -> Result<String, String> {
     let mut buffer = vec![0_u8; 16 * 1024];
     let size = timeout(Duration::from_secs(10), stream.read(&mut buffer))
         .await
         .map_err(|_| "ChatGPT callback timed out".to_owned())?
         .map_err(|error| format!("Could not read the login callback: {error}"))?;
-    let request = String::from_utf8_lossy(&buffer[..size]);
+    Ok(String::from_utf8_lossy(&buffer[..size]).into_owned())
+}
+
+async fn process_callback(
+    request: &str,
+    expected_state: &str,
+    verifier: &str,
+) -> Result<OAuthCredentials, String> {
     let target = request
         .lines()
         .next()
@@ -187,33 +212,38 @@ async fn receive_callback(
     let callback = Url::parse(&format!("http://localhost{target}"))
         .map_err(|_| "ChatGPT returned a malformed callback URL".to_owned())?;
 
-    let result = if callback.path() != "/auth/callback" {
-        Err("Unexpected login callback path".to_owned())
-    } else if let Some(error) = callback
+    if callback.path() != "/auth/callback" {
+        return Err("Unexpected login callback path".to_owned());
+    }
+    if let Some(error) = callback
         .query_pairs()
         .find(|(key, _)| key == "error_description" || key == "error")
         .map(|(_, value)| value.into_owned())
     {
-        Err(error)
-    } else if callback
+        return Err(error);
+    }
+    if callback
         .query_pairs()
         .find(|(key, _)| key == "state")
         .map(|(_, value)| value != expected_state)
         .unwrap_or(true)
     {
-        Err("Login state did not match; authorization was rejected".to_owned())
-    } else {
-        let code = callback
-            .query_pairs()
-            .find(|(key, _)| key == "code")
-            .map(|(_, value)| value.into_owned())
-            .ok_or_else(|| "ChatGPT did not return an authorization code".to_owned())?;
-        match exchange_code(&code, verifier).await {
-            Ok(credentials) => secrets::save_oauth(&credentials).map(|()| credentials),
-            Err(error) => Err(error),
-        }
-    };
+        return Err("Login state did not match; authorization was rejected".to_owned());
+    }
+    let code = callback
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| "ChatGPT did not return an authorization code".to_owned())?;
+    let credentials = exchange_code(&code, verifier).await?;
+    secrets::save_oauth(&credentials)?;
+    Ok(credentials)
+}
 
+async fn write_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    result: &Result<OAuthCredentials, String>,
+) {
     let (status, title, detail) = match &result {
         Ok(_) => ("200 OK", "Sign-in complete", "You can return to Unfold."),
         Err(error) => ("400 Bad Request", "Sign-in failed", error.as_str()),
@@ -227,7 +257,6 @@ async fn receive_callback(
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
-    result
 }
 
 fn bind_callback_listeners(port: u16) -> std::io::Result<CallbackListeners> {
@@ -344,6 +373,29 @@ fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_invalid_callback_requests_before_token_exchange() {
+        let cases = [
+            ("garbage", "ChatGPT returned a malformed callback"),
+            ("GET /wrong HTTP/1.1", "Unexpected login callback path"),
+            ("GET /auth/callback?error=denied HTTP/1.1", "denied"),
+            (
+                "GET /auth/callback?state=wrong HTTP/1.1",
+                "Login state did not match",
+            ),
+            (
+                "GET /auth/callback?state=expected HTTP/1.1",
+                "did not return an authorization code",
+            ),
+        ];
+        for (request, expected) in cases {
+            let error = process_callback(request, "expected", "verifier")
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
     use tokio::net::TcpStream;
 
     #[test]
