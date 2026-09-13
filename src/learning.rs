@@ -47,10 +47,7 @@ pub fn visible_content(value: &str) -> String {
 fn strip_marker(value: &str, name: &str) -> String {
     let mut text = value.to_owned();
     let needle = format!("<!--{name}");
-    loop {
-        let Some(start) = find_ascii_case(&text, &needle) else {
-            break;
-        };
+    while let Some(start) = find_ascii_case(&text, &needle) {
         match text[start..].find("-->") {
             Some(end) => text.replace_range(start..start + end + 3, ""),
             None => {
@@ -66,10 +63,7 @@ fn strip_tag(value: &str, tag: &str) -> String {
     let mut text = value.to_owned();
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
-    loop {
-        let Some(start) = find_ascii_case(&text, &open) else {
-            break;
-        };
+    while let Some(start) = find_ascii_case(&text, &open) {
         let tail = &text[start..];
         match find_ascii_case(tail, &close) {
             Some(end) => text.replace_range(start..start + end + close.len(), ""),
