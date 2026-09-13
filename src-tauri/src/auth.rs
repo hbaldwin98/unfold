@@ -5,7 +5,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
-use reqwest::Client;
+use reqwest::{Client, redirect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -89,43 +89,68 @@ pub async fn start_login(app: AppHandle) -> Result<String, String> {
 }
 
 pub async fn valid_access_token() -> Result<(String, Option<String>), String> {
-    let mut credentials = secrets::load_oauth()?
-        .ok_or_else(|| "Sign in to ChatGPT before generating an example".to_owned())?;
+    let mut credentials = load_credentials()?;
     let now = now_ms()?;
     if credentials.expires_at_ms > now + 30_000 {
         return Ok((credentials.access_token, credentials.account_id));
     }
 
-    let tokens: TokenResponse = Client::new()
-        .post(format!("{ISSUER}/oauth/token"))
-        .form(&[
+    refresh_credentials(&mut credentials, now).await?;
+    Ok((credentials.access_token, credentials.account_id))
+}
+
+fn load_credentials() -> Result<OAuthCredentials, String> {
+    secrets::load_oauth()?
+        .ok_or_else(|| "Sign in to ChatGPT before generating an example".to_owned())
+}
+
+async fn refresh_credentials(credentials: &mut OAuthCredentials, now: u64) -> Result<(), String> {
+    let tokens = request_tokens(
+        &[
             ("grant_type", "refresh_token"),
             ("refresh_token", credentials.refresh_token.as_str()),
             ("client_id", CLIENT_ID),
-        ])
+        ],
+        "Could not refresh ChatGPT sign-in",
+        "ChatGPT sign-in has expired",
+    )
+    .await?;
+
+    update_credentials(credentials, tokens, now);
+    secrets::save_oauth(credentials)
+}
+
+async fn request_tokens(
+    form: &[(&str, &str)],
+    send_error: &str,
+    status_error: &str,
+) -> Result<TokenResponse, String> {
+    auth_client()?
+        .post(format!("{ISSUER}/oauth/token"))
+        .form(form)
         .send()
         .await
-        .map_err(|error| format!("Could not refresh ChatGPT sign-in: {error}"))?
+        .map_err(|error| format!("{send_error}: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("ChatGPT sign-in has expired: {error}"))?
+        .map_err(|error| format!("{status_error}: {error}"))?
         .json()
         .await
-        .map_err(|error| format!("ChatGPT returned an invalid token response: {error}"))?;
+        .map_err(|error| format!("ChatGPT returned an invalid token response: {error}"))
+}
 
+fn update_credentials(credentials: &mut OAuthCredentials, tokens: TokenResponse, now: u64) {
     credentials.access_token = tokens.access_token;
     credentials.refresh_token = tokens.refresh_token;
     credentials.expires_at_ms = now + tokens.expires_in.unwrap_or(3600) * 1000;
     if let Some(id_token) = tokens.id_token {
         let claims = jwt_claims(&id_token);
-        credentials.account_id = account_id(&claims).or(credentials.account_id);
+        credentials.account_id = account_id(&claims).or(credentials.account_id.take());
         credentials.email = claims
             .get("email")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or(credentials.email);
+            .or(credentials.email.take());
     }
-    secrets::save_oauth(&credentials)?;
-    Ok((credentials.access_token, credentials.account_id))
 }
 
 async fn receive_callback(
@@ -230,23 +255,18 @@ fn bind_loopback(domain: Domain, address: SocketAddr) -> std::io::Result<TcpList
 }
 
 async fn exchange_code(code: &str, verifier: &str) -> Result<OAuthCredentials, String> {
-    let tokens: TokenResponse = Client::new()
-        .post(format!("{ISSUER}/oauth/token"))
-        .form(&[
+    let tokens = request_tokens(
+        &[
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", CALLBACK),
             ("client_id", CLIENT_ID),
             ("code_verifier", verifier),
-        ])
-        .send()
-        .await
-        .map_err(|error| format!("Could not exchange the authorization code: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("ChatGPT rejected the authorization code: {error}"))?
-        .json()
-        .await
-        .map_err(|error| format!("ChatGPT returned an invalid token response: {error}"))?;
+        ],
+        "Could not exchange the authorization code",
+        "ChatGPT rejected the authorization code",
+    )
+    .await?;
     let claims = tokens
         .id_token
         .as_deref()
@@ -263,6 +283,15 @@ async fn exchange_code(code: &str, verifier: &str) -> Result<OAuthCredentials, S
             .and_then(Value::as_str)
             .map(str::to_owned),
     })
+}
+
+fn auth_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("Could not configure ChatGPT sign-in: {error}"))
 }
 
 fn random_url_safe(bytes: usize) -> String {
@@ -328,6 +357,35 @@ mod tests {
     #[test]
     fn escapes_callback_error_html() {
         assert_eq!(html_escape("<bad & worse>"), "&lt;bad &amp; worse&gt;");
+    }
+
+    #[test]
+    fn refreshed_tokens_update_claims_and_expiry() {
+        let claims = URL_SAFE_NO_PAD.encode(br#"{"email":"new@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"new-account"}}"#);
+        let mut credentials = OAuthCredentials {
+            access_token: "old-access".to_owned(),
+            refresh_token: "old-refresh".to_owned(),
+            expires_at_ms: 0,
+            account_id: Some("old-account".to_owned()),
+            email: Some("old@example.com".to_owned()),
+        };
+
+        update_credentials(
+            &mut credentials,
+            TokenResponse {
+                access_token: "new-access".to_owned(),
+                refresh_token: "new-refresh".to_owned(),
+                id_token: Some(format!("header.{claims}.signature")),
+                expires_in: Some(120),
+            },
+            1_000,
+        );
+
+        assert_eq!(credentials.access_token, "new-access");
+        assert_eq!(credentials.refresh_token, "new-refresh");
+        assert_eq!(credentials.expires_at_ms, 121_000);
+        assert_eq!(credentials.account_id.as_deref(), Some("new-account"));
+        assert_eq!(credentials.email.as_deref(), Some("new@example.com"));
     }
 
     #[tokio::test]

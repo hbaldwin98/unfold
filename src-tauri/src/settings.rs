@@ -84,9 +84,21 @@ impl Settings {
             if url.host_str().is_none() {
                 return Err("Endpoint must include a host".to_owned());
             }
+            if url.scheme() == "http" && !is_loopback(&url) {
+                return Err("Non-local endpoints must use HTTPS".to_owned());
+            }
         }
 
         Ok(())
+    }
+}
+
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
     }
 }
 
@@ -140,6 +152,41 @@ mod tests {
             settings.validate(),
             Err("Endpoint must use HTTP or HTTPS".to_owned())
         );
+    }
+
+    #[test]
+    fn compatible_provider_requires_https_for_remote_hosts() {
+        for base_url in ["http://example.com", "http://192.168.1.20:11434"] {
+            let settings = Settings {
+                provider: Provider::Compatible,
+                base_url: base_url.to_owned(),
+                ..Settings::default()
+            };
+
+            assert_eq!(
+                settings.validate(),
+                Err("Non-local endpoints must use HTTPS".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_provider_allows_http_only_on_loopback() {
+        for base_url in [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434",
+            "http://127.8.9.10:11434",
+            "http://[::1]:11434",
+            "https://example.com",
+        ] {
+            let settings = Settings {
+                provider: Provider::Compatible,
+                base_url: base_url.to_owned(),
+                ..Settings::default()
+            };
+
+            assert_eq!(settings.validate(), Ok(()), "{base_url}");
+        }
     }
 
     #[test]

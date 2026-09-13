@@ -4,6 +4,7 @@ version = "0.3.0"
 description = "A focused desktop app for guided learning"
 authors = ["Unfold contributors"]
 edition = "2024"
+license = "MIT"
 
 [lib]
 name = "unfold_lib"

@@ -120,6 +120,11 @@ Release artifacts are written to:
   provider requests directly.
 - The application exposes no general shell or arbitrary HTTP Tauri command.
 
+Non-local compatible endpoints must use HTTPS. Plain HTTP is accepted only for
+loopback development services such as `localhost`, `127.0.0.1`, and `::1`.
+
+Report suspected vulnerabilities according to [SECURITY.md](SECURITY.md).
+
 ## Stability Notice
 
 ChatGPT subscription mode sends authenticated requests to the ChatGPT Codex
@@ -131,3 +136,7 @@ Responses API. The implementation is intentionally isolated in
 Model availability depends on the signed-in subscription, workspace policy,
 and OpenAI's current Codex model catalog. If this integration changes, the
 OpenAI-compatible endpoint remains an independent provider path.
+
+## License
+
+Unfold is available under the [MIT License](LICENSE).
