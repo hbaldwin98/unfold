@@ -18,7 +18,7 @@ Non-secret settings are stored in the operating system configuration directory. 
 - `F1`: help
 - `F2`: switch Socratic/Worked Example mode before starting
 - `F3`: toggle provider web search
-- `F4`: edit provider, protocol, URL, model, reasoning, theme, and API key
+- `Ctrl+P` / `F4`: open the searchable command palette; type to filter, navigate with arrows, `j`/`k`, `Ctrl+N`/`Ctrl+P`, or `Ctrl+J`/`Ctrl+K`, then press `Enter`
 - `F5`: another Socratic hint
 - `F6` / `F7`: ChatGPT browser login / logout
 - `F8` / `Ctrl+M`: open the provider model catalog, then choose supported reasoning effort
@@ -34,7 +34,9 @@ Non-secret settings are stored in the operating system configuration directory. 
 - `Ctrl+N`: clear the in-memory session and start a new problem
 - `Ctrl+Q`: quit
 
-In Settings, use `Tab`/`Shift+Tab` to select a field, arrows to cycle choices, type to edit text fields, and `Enter` or `F2` to save. Press `Enter` on Model to open the catalog. `Esc` discards the complete draft. Enter `CLEAR` in the API key field to remove the stored key; an empty field leaves it unchanged. Catppuccin Latte, Frappe, Macchiato, and Mocha themes persist with the other non-secret settings.
+Configuration commands open compact pickers or editors. `Enter` explicitly saves a setting and `Esc` cancels it. Enter `CLEAR` in the API key editor to remove the stored key; an empty value leaves it unchanged. Model selection continues into its supported reasoning-effort picker. Catppuccin Latte, Frappe, Macchiato, and Mocha themes persist with the other non-secret settings.
+
+Responses are rendered through the `daat-locus-md` Ratatui 0.30-compatible fork of `ratatui-markdown`, preserving styled Markdown and one deterministic visible-text projection for selection and copying.
 
 Bracketed paste, focus events, and mouse capture are enabled while Unfold runs and disabled during terminal restoration. Pasted and copied transcript content passes through the same terminal-control sanitization as provider output.
 

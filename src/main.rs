@@ -29,6 +29,10 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
+use ratatui_markdown::{
+    markdown::MarkdownRenderer,
+    theme::{Generation, RichTextTheme},
+};
 use settings::{Protocol, Provider, ReasoningEffort, Settings, Theme};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -92,6 +96,16 @@ impl Viewport {
 }
 
 enum Popup {
+    Palette {
+        query: String,
+        state: ListState,
+    },
+    Setting {
+        command: Command,
+        draft: SettingsDraft,
+        input: String,
+        state: ListState,
+    },
     Models {
         request_id: u64,
         state: ListState,
@@ -103,6 +117,59 @@ enum Popup {
         model: ModelOption,
         state: ListState,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Model,
+    Provider,
+    Protocol,
+    Endpoint,
+    ApiKey,
+    Theme,
+    LearningMode,
+    WebSearch,
+    Login,
+    Logout,
+    NewSession,
+    Help,
+    Quit,
+}
+
+impl Command {
+    const ALL: [Self; 13] = [
+        Self::Model,
+        Self::Provider,
+        Self::Protocol,
+        Self::Endpoint,
+        Self::ApiKey,
+        Self::Theme,
+        Self::LearningMode,
+        Self::WebSearch,
+        Self::Login,
+        Self::Logout,
+        Self::NewSession,
+        Self::Help,
+        Self::Quit,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Choose model and reasoning",
+            Self::Provider => "Choose provider",
+            Self::Protocol => "Choose protocol",
+            Self::Endpoint => "Edit endpoint",
+            Self::ApiKey => "Set or clear API key",
+            Self::Theme => "Choose theme",
+            Self::LearningMode => "Choose learning mode",
+            Self::WebSearch => "Toggle web search",
+            Self::Login => "Log in to ChatGPT",
+            Self::Logout => "Log out of ChatGPT",
+            Self::NewSession => "New session",
+            Self::Help => "Help",
+            Self::Quit => "Quit",
+        }
+    }
 }
 
 enum AppEvent {
@@ -136,6 +203,7 @@ struct App {
     transcript_lines: usize,
     selection: Option<(usize, usize)>,
     selection_anchor: usize,
+    quit_requested: bool,
 }
 
 impl App {
@@ -183,6 +251,7 @@ impl App {
             transcript_lines: 0,
             selection: None,
             selection_anchor: 0,
+            quit_requested: false,
         }
     }
 
@@ -276,7 +345,7 @@ impl App {
         if self
             .turns
             .last()
-            .is_some_and(|turn| turn.content.trim().is_empty())
+            .is_some_and(|turn| learning::visible_content(&turn.content).trim().is_empty())
         {
             self.turns.pop();
         }
@@ -311,6 +380,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn open_settings(&mut self) {
         self.settings_draft = Some(SettingsDraft {
             values: self.settings.clone(),
@@ -318,6 +388,140 @@ impl App {
         });
         self.settings_field = 0;
         self.screen = Screen::Settings;
+    }
+
+    fn open_palette(&mut self) {
+        let mut state = ListState::default();
+        state.select(Some(0));
+        self.popup = Some(Popup::Palette {
+            query: String::new(),
+            state,
+        });
+    }
+
+    fn filtered_commands(query: &str) -> Vec<Command> {
+        let query = query.to_ascii_lowercase();
+        Command::ALL
+            .into_iter()
+            .filter(|command| command.label().to_ascii_lowercase().contains(&query))
+            .collect()
+    }
+
+    fn open_setting(&mut self, command: Command) {
+        let mut state = ListState::default();
+        state.select(Some(match command {
+            Command::Provider => usize::from(self.settings.provider == Provider::Compatible),
+            Command::Protocol => usize::from(self.settings.protocol == Protocol::ChatCompletions),
+            Command::Theme => match self.settings.theme {
+                Theme::Latte => 0,
+                Theme::Frappe => 1,
+                Theme::Macchiato => 2,
+                Theme::Mocha => 3,
+            },
+            Command::LearningMode => usize::from(self.mode == LearningMode::WorkedExample),
+            _ => 0,
+        }));
+        let input = match command {
+            Command::Endpoint => self.settings.base_url.clone(),
+            Command::ApiKey => String::new(),
+            _ => String::new(),
+        };
+        self.popup = Some(Popup::Setting {
+            command,
+            draft: SettingsDraft {
+                values: self.settings.clone(),
+                api_key: String::new(),
+            },
+            input,
+            state,
+        });
+    }
+
+    fn execute_command(&mut self, command: Command) {
+        match command {
+            Command::Model => {
+                self.popup = None;
+                self.refresh_models();
+            }
+            Command::Provider
+            | Command::Protocol
+            | Command::Endpoint
+            | Command::ApiKey
+            | Command::Theme
+            | Command::LearningMode => self.open_setting(command),
+            Command::WebSearch => {
+                self.toggle_search();
+                self.popup = None;
+            }
+            Command::Login => {
+                self.popup = None;
+                self.login();
+            }
+            Command::Logout => {
+                self.popup = None;
+                self.logout();
+            }
+            Command::NewSession => {
+                self.popup = None;
+                self.new_problem();
+            }
+            Command::Help => {
+                self.popup = None;
+                self.screen = Screen::Help;
+            }
+            Command::Quit => self.quit_requested = true,
+        }
+    }
+
+    fn confirm_setting(&mut self) {
+        let Some(Popup::Setting {
+            command,
+            mut draft,
+            input,
+            state,
+        }) = self.popup.take()
+        else {
+            return;
+        };
+        let selected = state.selected();
+        let selected_mode = selected_learning_mode(command, selected);
+        let editor_input = input.clone();
+        apply_setting_draft(&mut draft, command, input, selected);
+        if self.settings_draft.is_some() {
+            self.settings_draft = Some(draft);
+            if let Some(mode) = selected_mode {
+                self.mode = mode;
+            }
+            self.reconcile_web_search();
+            self.status = "Setting updated in draft".into();
+            return;
+        }
+        match save_settings_transaction(
+            &self.settings,
+            &draft.values,
+            api_key_update(&draft.api_key),
+            settings::save,
+            secrets::save_api_key,
+        ) {
+            Ok(()) => {
+                self.settings = draft.values;
+                if let Some(mode) = selected_mode {
+                    self.mode = mode;
+                }
+                self.reconcile_web_search();
+                self.status = "Setting saved".into();
+                self.open_palette();
+            }
+            Err(error) => {
+                self.status = error;
+                self.popup = Some(Popup::Setting {
+                    command,
+                    draft,
+                    input: editor_input,
+                    state,
+                });
+            }
+        }
     }
 
     fn close_settings(&mut self) {
@@ -495,6 +699,10 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('p') if self.popup.is_none() => {
+                    self.open_palette();
+                    return false;
+                }
                 KeyCode::Char('q') => return true,
                 KeyCode::Char('c') if self.selection.is_some() => {
                     self.copy_selection();
@@ -513,7 +721,7 @@ impl App {
         }
         if self.popup.is_some() {
             self.handle_popup_key(key);
-            return false;
+            return self.quit_requested;
         }
         match self.screen {
             Screen::Help => self.screen = Screen::Main,
@@ -579,7 +787,7 @@ impl App {
                 }
             }
             3 => self.toggle_search(),
-            4 => self.open_settings(),
+            4 => self.open_palette(),
             5 if self.mode == LearningMode::Socratic && !self.turns.is_empty() => {
                 self.start(LearningAction::AnotherHint, None)
             }
@@ -607,17 +815,93 @@ impl App {
     }
 
     fn handle_popup_key(&mut self, key: KeyEvent) {
+        if matches!(self.popup, Some(Popup::Palette { .. })) {
+            self.handle_palette_key(key);
+        } else if matches!(self.popup, Some(Popup::Setting { .. })) {
+            self.handle_setting_key(key);
+        } else {
+            self.handle_model_popup_key(key);
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        if let Some(delta) = palette_navigation(key) {
+            self.move_popup(delta);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Enter => {
+                if let Some(command) = self.selected_palette_command() {
+                    self.execute_command(command);
+                }
+            }
+            KeyCode::Backspace => self.edit_palette_query(None),
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.edit_palette_query(Some(character));
+            }
+            _ => {}
+        }
+    }
+
+    fn selected_palette_command(&self) -> Option<Command> {
+        match &self.popup {
+            Some(Popup::Palette { query, state }) => state
+                .selected()
+                .and_then(|index| Self::filtered_commands(query).get(index).copied()),
+            _ => None,
+        }
+    }
+
+    fn edit_palette_query(&mut self, character: Option<char>) {
+        if let Some(Popup::Palette { query, state }) = &mut self.popup {
+            if let Some(character) = character {
+                query.push(character);
+            } else {
+                query.pop();
+            }
+            state.select(Some(0));
+        }
+    }
+
+    fn handle_setting_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.open_palette(),
+            KeyCode::Enter => self.confirm_setting(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
+            KeyCode::Backspace => self.edit_popup_setting(None),
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.edit_popup_setting(Some(character));
+            }
+            _ => {}
+        }
+    }
+
+    fn edit_popup_setting(&mut self, character: Option<char>) {
+        if let Some(Popup::Setting {
+            command: Command::Endpoint | Command::ApiKey,
+            input,
+            ..
+        }) = &mut self.popup
+        {
+            if let Some(character) = character {
+                input.push(character);
+            } else {
+                input.pop();
+            }
+        }
+    }
+
+    fn handle_model_popup_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.popup = None,
             KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
-            KeyCode::Enter => {
-                if matches!(self.popup, Some(Popup::Effort { .. })) {
-                    self.confirm_effort()
-                } else {
-                    self.select_model()
-                }
+            KeyCode::Enter if matches!(self.popup, Some(Popup::Effort { .. })) => {
+                self.confirm_effort()
             }
+            KeyCode::Enter => self.select_model(),
             KeyCode::Char('r') if matches!(self.popup, Some(Popup::Models { .. })) => {
                 self.refresh_models()
             }
@@ -627,11 +911,17 @@ impl App {
 
     fn move_popup(&mut self, delta: isize) {
         match &mut self.popup {
+            Some(Popup::Palette { query, state }) => {
+                move_list(state, Self::filtered_commands(query).len(), delta)
+            }
+            Some(Popup::Setting { command, state, .. }) => {
+                move_list(state, setting_choices(*command).len(), delta)
+            }
             Some(Popup::Models { state, models, .. }) => move_list(state, models.len(), delta),
             Some(Popup::Effort { state, model }) => {
                 move_list(state, model.reasoning_efforts.len() + 1, delta)
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -698,10 +988,19 @@ impl App {
     }
 
     fn insert_paste(&mut self, text: &str) {
+        let clean = sanitize_paste(text);
+        if let Some(Popup::Setting {
+            command: Command::Endpoint | Command::ApiKey,
+            input,
+            ..
+        }) = &mut self.popup
+        {
+            input.push_str(&clean);
+            return;
+        }
         if self.popup.is_some() {
             return;
         }
-        let clean = sanitize_paste(text);
         if self.screen == Screen::Settings {
             for character in clean.chars() {
                 self.edit_setting(Some(character));
@@ -712,7 +1011,11 @@ impl App {
     }
 
     fn paste_clipboard(&mut self) {
-        match Clipboard::new().and_then(|mut value| value.get_text()) {
+        self.paste_clipboard_with(|| Clipboard::new().and_then(|mut value| value.get_text()));
+    }
+
+    fn paste_clipboard_with(&mut self, read: impl FnOnce() -> Result<String, arboard::Error>) {
+        match read() {
             Ok(text) => self.insert_paste(&text),
             Err(error) => self.status = format!("Clipboard paste failed: {error}"),
         }
@@ -788,6 +1091,20 @@ impl App {
         }
         let item_row = usize::from(row - area.y - 1);
         match &mut self.popup {
+            Some(Popup::Palette { query, state })
+                if state.offset() + item_row < Self::filtered_commands(query).len() =>
+            {
+                let index = state.offset() + item_row;
+                state.select(Some(index));
+                let command = Self::filtered_commands(query)[index];
+                self.execute_command(command);
+            }
+            Some(Popup::Setting { command, state, .. })
+                if state.offset() + item_row < setting_choices(*command).len() =>
+            {
+                state.select(Some(state.offset() + item_row));
+                self.confirm_setting();
+            }
             Some(Popup::Models { state, models, .. })
                 if state.offset() + item_row / 2 < models.len() =>
             {
@@ -880,15 +1197,15 @@ impl App {
                 learning::strip_controls(&self.target)
             ));
         }
-        for turn in &self.turns {
+        for (index, turn) in self.turns.iter().enumerate() {
             if let Some(detail) = &turn.detail {
                 text.push_str(&format!("You\n{}\n\n", learning::strip_controls(detail)));
             }
-            text.push_str(&format!(
-                "{}\n{}\n\n",
-                turn.label,
-                learning::visible_content(&turn.content)
-            ));
+            let visible = learning::visible_content(&turn.content);
+            if self.active.is_some() && index + 1 == self.turns.len() && visible.trim().is_empty() {
+                continue;
+            }
+            text.push_str(&format!("{}\n{}\n\n", turn.label, visible));
         }
         if text.is_empty() {
             "Type a problem below. Choose the mode before starting with F2.".into()
@@ -905,7 +1222,10 @@ impl App {
     }
 
     fn transcript_rendered_plain(&self) -> String {
-        text_plain(&self.transcript_rendered())
+        text_plain(&markdown_text(
+            &self.transcript_source(),
+            palette(self.current_settings().theme),
+        ))
     }
 
     fn transcript_display_rows(&self) -> usize {
@@ -931,6 +1251,66 @@ fn move_list(state: &mut ListState, length: usize, delta: isize) {
     }
     let current = state.selected().unwrap_or(0);
     state.select(Some(current.saturating_add_signed(delta).min(length - 1)));
+}
+
+fn palette_navigation(key: KeyEvent) -> Option<isize> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, control) {
+        (KeyCode::Up | KeyCode::Char('k'), false)
+        | (KeyCode::Char('p') | KeyCode::Char('k'), true) => Some(-1),
+        (KeyCode::Down | KeyCode::Char('j'), false)
+        | (KeyCode::Char('n') | KeyCode::Char('j'), true) => Some(1),
+        _ => None,
+    }
+}
+
+fn setting_choices(command: Command) -> &'static [&'static str] {
+    match command {
+        Command::Provider => &["ChatGPT", "OpenAI-compatible"],
+        Command::Protocol => &["Responses", "Chat Completions"],
+        Command::Theme => &["Latte", "Frappe", "Macchiato", "Mocha"],
+        Command::LearningMode => &["Socratic", "Worked example"],
+        _ => &[],
+    }
+}
+
+fn selected_learning_mode(command: Command, selected: Option<usize>) -> Option<LearningMode> {
+    (command == Command::LearningMode).then_some(if selected == Some(1) {
+        LearningMode::WorkedExample
+    } else {
+        LearningMode::Socratic
+    })
+}
+
+fn apply_setting_draft(
+    draft: &mut SettingsDraft,
+    command: Command,
+    input: String,
+    selected: Option<usize>,
+) {
+    match command {
+        Command::Provider => {
+            draft.values.provider = if selected == Some(1) {
+                Provider::Compatible
+            } else {
+                Provider::Chatgpt
+            }
+        }
+        Command::Protocol => {
+            draft.values.protocol = if selected == Some(1) {
+                Protocol::ChatCompletions
+            } else {
+                Protocol::Responses
+            }
+        }
+        Command::Endpoint => draft.values.base_url = input,
+        Command::ApiKey => draft.api_key = input,
+        Command::Theme => {
+            draft.values.theme =
+                [Theme::Latte, Theme::Frappe, Theme::Macchiato, Theme::Mocha][selected.unwrap_or(0)]
+        }
+        _ => {}
+    }
 }
 
 fn parse_effort(value: &str) -> Option<ReasoningEffort> {
@@ -1117,52 +1497,67 @@ fn palette(theme: Theme) -> Palette {
     }
 }
 
-fn markdown_text(value: &str, colors: Palette) -> Text<'static> {
-    let mut lines = Vec::new();
-    let mut code = false;
-    for raw in value.lines() {
-        if raw.trim_start().starts_with("```") {
-            code = !code;
-            continue;
-        }
-        let (content, style) = if code {
-            (raw, Style::new().fg(colors.green).bg(colors.surface))
-        } else if let Some(text) = raw.strip_prefix("### ") {
-            (
-                text,
-                Style::new().fg(colors.accent).add_modifier(Modifier::BOLD),
-            )
-        } else if let Some(text) = raw.strip_prefix("## ") {
-            (
-                text,
-                Style::new()
-                    .fg(colors.accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
-        } else if let Some(text) = raw.strip_prefix("# ") {
-            (
-                text,
-                Style::new()
-                    .fg(colors.accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
-        } else if let Some(text) = raw.strip_prefix("- ").or_else(|| raw.strip_prefix("* ")) {
-            lines.push(Line::from(vec![
-                Span::styled("  * ", Style::new().fg(colors.accent)),
-                Span::styled(text.to_owned(), Style::new().fg(colors.text)),
-            ]));
-            continue;
-        } else if let Some(text) = raw.strip_prefix("> ") {
-            (
-                text,
-                Style::new().fg(colors.muted).add_modifier(Modifier::ITALIC),
-            )
-        } else {
-            (raw, Style::new().fg(colors.text))
-        };
-        lines.push(Line::styled(content.to_owned(), style));
+struct MarkdownTheme(Palette);
+
+impl RichTextTheme for MarkdownTheme {
+    fn generation(&self) -> Generation {
+        Generation(0)
     }
-    Text::from(lines)
+    fn get_text_color(&self) -> Color {
+        self.0.text
+    }
+    fn get_muted_text_color(&self) -> Color {
+        self.0.muted
+    }
+    fn get_primary_color(&self) -> Color {
+        self.0.accent
+    }
+    fn get_secondary_color(&self) -> Color {
+        self.0.green
+    }
+    fn get_info_color(&self) -> Color {
+        self.0.accent
+    }
+    fn get_background_color(&self) -> Color {
+        self.0.base
+    }
+    fn get_border_color(&self) -> Color {
+        self.0.surface
+    }
+    fn get_focused_border_color(&self) -> Color {
+        self.0.accent
+    }
+    fn get_popup_selected_background(&self) -> Color {
+        self.0.accent
+    }
+    fn get_popup_selected_text_color(&self) -> Color {
+        self.0.base
+    }
+    fn get_json_key_color(&self) -> Color {
+        self.0.accent
+    }
+    fn get_json_string_color(&self) -> Color {
+        self.0.green
+    }
+    fn get_json_number_color(&self) -> Color {
+        self.0.yellow
+    }
+    fn get_json_bool_color(&self) -> Color {
+        self.0.yellow
+    }
+    fn get_json_null_color(&self) -> Color {
+        self.0.muted
+    }
+    fn get_accent_yellow(&self) -> Color {
+        self.0.yellow
+    }
+}
+
+fn markdown_text(value: &str, colors: Palette) -> Text<'static> {
+    // Ratatui wraps this unwrapped styled text to the transcript's current inner width.
+    let renderer = MarkdownRenderer::new(0);
+    let blocks = renderer.parse(value);
+    Text::from(renderer.render(&blocks, &MarkdownTheme(colors)))
 }
 
 fn text_plain(text: &Text<'_>) -> String {
@@ -1299,13 +1694,44 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
         Paragraph::new(text)
             .block(
                 Block::bordered()
-                    .title(title)
+                    .title(Line::styled(
+                        title,
+                        Style::new().fg(colors.text).add_modifier(Modifier::BOLD),
+                    ))
                     .border_style(Style::new().fg(colors.surface)),
             )
             .wrap(Wrap { trim: false })
             .scroll((app.viewport.offset.min(u16::MAX as usize) as u16, 0)),
         body,
     );
+    if app.active.is_some()
+        && app
+            .turns
+            .last()
+            .is_some_and(|turn| learning::visible_content(&turn.content).trim().is_empty())
+    {
+        let area = centered(46, 28, body);
+        let spinner = ["|", "/", "-", "\\"][(app.tick as usize) % 4];
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "\n{spinner}  Preparing {}...",
+                if app.mode == LearningMode::Socratic {
+                    "your first prompt"
+                } else {
+                    "worked example"
+                }
+            ))
+            .centered()
+            .style(Style::new().fg(colors.yellow).add_modifier(Modifier::BOLD))
+            .block(
+                Block::bordered()
+                    .title(" Loading ")
+                    .border_style(Style::new().fg(colors.accent)),
+            ),
+            area,
+        );
+    }
     let mut scrollbar = ScrollbarState::new(app.transcript_lines)
         .position(app.viewport.offset)
         .viewport_content_length(app.body_height());
@@ -1338,7 +1764,26 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
     } else {
         "."
     };
-    frame.render_widget(Paragraph::new(Text::from(vec![Line::from(vec![Span::styled(format!("{spinner} "), Style::new().fg(if app.active.is_some() { colors.yellow } else { colors.green })), Span::raw(app.status.as_str())]), Line::styled("F1 help  F4 settings  F8 models  PgUp/PgDn scroll  Ctrl+C/V copy/paste  Ctrl+Q quit", Style::new().fg(colors.muted))])), footer);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::new().fg(if app.active.is_some() {
+                        colors.yellow
+                    } else {
+                        colors.green
+                    }),
+                ),
+                Span::raw(app.status.as_str()),
+            ]),
+            Line::styled(
+                "Ctrl+P commands  F1 help  PgUp/PgDn scroll  Ctrl+C/V copy/paste  Ctrl+Q quit",
+                Style::new().fg(colors.text),
+            ),
+        ])),
+        footer,
+    );
 }
 
 fn render_settings(frame: &mut Frame, app: &App, colors: Palette) {
@@ -1392,7 +1837,7 @@ fn render_settings(frame: &mut Frame, app: &App, colors: Palette) {
 }
 
 fn render_help(frame: &mut Frame, colors: Palette) {
-    let help = "KEYBOARD\nEnter  Start/send or confirm dialog\nEsc  Cancel response or close dialog\nF2  Mode (before session) / save settings\nF3  Web search\nF4  Settings\nF5  Another hint\nF6/F7  Login/logout\nF8 or Ctrl+M  Model and reasoning picker\nF9/F10/F12  Explain/check/reveal\nPgUp/PgDn or mouse wheel  Scroll\nCtrl+Home/End  Top/follow latest\nShift+Left/Right  Extend transcript selection\nCtrl+C/Ctrl+V  Copy selection/paste\nCtrl+N  New problem\nCtrl+Q  Quit (discard open settings edits)\n\nMOUSE\nWheel scrolls. Drag selects transcript text. Click dialog choices.\n\nPress any key to return.";
+    let help = "KEYBOARD\nCtrl+P or F4  Search commands and configuration\nPalette: type to filter; arrows, j/k, Ctrl+N/P, or Ctrl+J/K navigate; Enter confirms; Esc cancels\nEnter  Start/send or confirm dialog\nEsc  Cancel response or close dialog\nF2  Mode before session\nF3  Web search\nF5  Another hint\nF8 or Ctrl+M  Model and reasoning picker\nF9/F10/F12  Explain/check/reveal\nPgUp/PgDn or mouse wheel  Scroll\nCtrl+Home/End  Top/follow latest\nShift+Left/Right  Extend transcript selection\nCtrl+C/Ctrl+V  Copy selection/paste into text editors\nCtrl+N  New problem (outside palette)\nCtrl+Q  Quit\n\nMOUSE\nWheel scrolls. Drag selects transcript text. Click palette and dialog choices to activate them; click setting text editors to focus.\n\nPress any key to return.";
     frame.render_widget(
         Paragraph::new(help)
             .style(Style::new().fg(colors.text))
@@ -1412,6 +1857,17 @@ fn render_popup(frame: &mut Frame, app: &mut App, colors: Palette) {
     frame.render_widget(Clear, area);
     frame.render_widget(Block::new().style(Style::new().bg(colors.base)), area);
     match &mut app.popup {
+        Some(Popup::Palette { query, state }) => {
+            render_palette_popup(frame, area, query, state, colors);
+        }
+        Some(Popup::Setting {
+            command,
+            input,
+            state,
+            ..
+        }) => {
+            render_setting_popup(frame, area, *command, input, state, colors);
+        }
         Some(Popup::Models {
             state,
             models,
@@ -1497,6 +1953,73 @@ fn render_popup(frame: &mut Frame, app: &mut App, colors: Palette) {
         }
         None => {}
     }
+}
+
+fn render_palette_popup(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    state: &mut ListState,
+    colors: Palette,
+) {
+    let items = App::filtered_commands(query)
+        .iter()
+        .map(|command| ListItem::new(command.label()))
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(format!(" Commands > {query}_ "))
+                .border_style(Style::new().fg(colors.accent)),
+        )
+        .highlight_style(
+            Style::new()
+                .fg(colors.base)
+                .bg(colors.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, area, state);
+}
+
+fn render_setting_popup(
+    frame: &mut Frame,
+    area: Rect,
+    command: Command,
+    input: &str,
+    state: &mut ListState,
+    colors: Palette,
+) {
+    let choices = setting_choices(command);
+    if choices.is_empty() {
+        let display = if command == Command::ApiKey && !input.is_empty() {
+            "*".repeat(input.chars().count())
+        } else {
+            input.to_owned()
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{display}_\n\nEnter saves / Esc cancels")).block(
+                Block::bordered()
+                    .title(format!(" {} ", command.label()))
+                    .border_style(Style::new().fg(colors.accent)),
+            ),
+            area,
+        );
+        return;
+    }
+    let list = List::new(choices.iter().map(|choice| ListItem::new(*choice)))
+        .block(
+            Block::bordered()
+                .title(format!(" {} / Enter saves / Esc cancels ", command.label()))
+                .border_style(Style::new().fg(colors.accent)),
+        )
+        .highlight_style(
+            Style::new()
+                .fg(colors.base)
+                .bg(colors.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, area, state);
 }
 
 fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1648,6 +2171,7 @@ mod tests {
             transcript_lines: 100,
             selection: None,
             selection_anchor: 0,
+            quit_requested: false,
         }
     }
 
@@ -1859,10 +2383,42 @@ mod tests {
             "## Head\n- item\n> quote\n```\ncode\n```",
             palette(Theme::Mocha),
         );
-        assert!(text.lines[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(text.lines[1].spans[0].content.contains('*'));
-        assert!(text.lines[2].style.add_modifier.contains(Modifier::ITALIC));
-        assert_eq!(text.lines[3].style.fg, Some(palette(Theme::Mocha).green));
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("Head")
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(text_plain(&text).contains("item"));
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("quote")
+                    && span.style.add_modifier.contains(Modifier::ITALIC))
+        );
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("code")
+                    && span.style.fg != Some(palette(Theme::Mocha).text))
+        );
+    }
+
+    #[test]
+    fn inline_code_is_distinct_and_math_delimiters_remain_readable() {
+        let colors = palette(Theme::Mocha);
+        let text = markdown_text("`get`: average $O(1)$", colors);
+        let get = text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "get")
+            .unwrap();
+        assert_ne!(get.style, Style::new().fg(colors.text));
+        assert!(text_plain(&text).contains("average $O(1)$"));
     }
 
     #[test]
@@ -1874,7 +2430,9 @@ mod tests {
             detail: None,
         });
         let plain = app.transcript_rendered_plain();
-        assert!(plain.contains("Heading\n  * café 🦀\nlet λ = 1;"));
+        assert!(plain.contains("Heading"));
+        assert!(plain.contains("café 🦀"));
+        assert!(plain.contains("let λ = 1;"));
         let start = plain
             .chars()
             .position(|character| character == 'c')
@@ -1897,13 +2455,13 @@ mod tests {
     }
 
     #[test]
-    fn paste_is_sanitized_and_inserted_into_active_editor() {
+    fn paste_event_is_sanitized_and_inserted_into_active_editor() {
         let mut app = test_app();
-        app.insert_paste("a\x1b[2J\r\nb");
+        app.handle_event(Event::Paste("a\x1b[2J\r\nb".into()));
         assert_eq!(app.input, "a\nb");
         app.open_settings();
         app.settings_field = 3;
-        app.insert_paste("x\x00y");
+        app.handle_event(Event::Paste("x\x00y".into()));
         assert!(
             app.settings_draft
                 .as_ref()
@@ -1912,6 +2470,54 @@ mod tests {
                 .model
                 .ends_with("xy")
         );
+    }
+
+    #[test]
+    fn setting_text_editors_accept_sanitized_event_and_ctrl_v_paste() {
+        let mut app = test_app();
+        app.open_setting(Command::Endpoint);
+        app.handle_event(Event::Paste("\x1b[2Jhttps://paste.test\r\n/v1".into()));
+        assert!(matches!(
+            &app.popup,
+            Some(Popup::Setting { input, .. }) if input.ends_with("https://paste.test\n/v1")
+        ));
+
+        app.open_setting(Command::ApiKey);
+        app.paste_clipboard_with(|| Ok("sec\x00ret".into()));
+        assert!(matches!(
+            &app.popup,
+            Some(Popup::Setting { input, .. }) if input == "secret"
+        ));
+    }
+
+    #[test]
+    fn paste_does_not_mutate_popup_choice_lists() {
+        let mut app = test_app();
+        app.open_setting(Command::Theme);
+        app.insert_paste("Mocha");
+        assert!(matches!(
+            &app.popup,
+            Some(Popup::Setting { input, state, .. })
+                if input.is_empty() && state.selected() == Some(3)
+        ));
+    }
+
+    #[test]
+    fn wide_transcript_does_not_wrap_or_copy_an_artificial_newline_at_column_120() {
+        let mut app = test_app();
+        app.body_area = Rect::new(0, 0, 180, 20);
+        let long = format!("{}tail", "word ".repeat(30));
+        app.target = long.clone();
+
+        let rendered = app.transcript_rendered();
+        assert!(rendered.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains(&long)
+        }));
+        assert!(app.transcript_rendered_plain().contains(&long));
     }
 
     #[test]
@@ -2055,6 +2661,313 @@ mod tests {
     }
 
     #[test]
+    fn pending_initial_turn_is_hidden_until_visible_text_and_removed_on_failure() {
+        for mode in [LearningMode::Socratic, LearningMode::WorkedExample] {
+            let mut app = test_app();
+            app.mode = mode;
+            app.target = "2 + 2".into();
+            app.turns.push(Turn {
+                label: learning::label(LearningAction::Initial, mode).into(),
+                content: String::new(),
+                detail: None,
+            });
+            app.active = Some((1, CancellationToken::new()));
+            assert!(
+                !app.transcript_source()
+                    .contains(app.turns[0].label.as_str())
+            );
+
+            app.handle_response(
+                1,
+                ResponseEvent::TextDelta {
+                    delta: "First token".into(),
+                },
+            );
+            assert!(
+                app.transcript_source()
+                    .contains(app.turns[0].label.as_str())
+            );
+            assert!(app.transcript_source().contains("First token"));
+
+            app.turns[0].content.clear();
+            app.handle_response(
+                1,
+                ResponseEvent::Failed {
+                    message: "network failed".into(),
+                },
+            );
+            assert!(app.turns.is_empty());
+            assert_eq!(app.status, "network failed");
+        }
+    }
+
+    #[test]
+    fn hidden_only_delta_keeps_pending_turn_hidden_and_loading_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = test_app();
+        app.target = "problem".into();
+        app.turns.push(Turn {
+            label: "Question".into(),
+            content: "<analysis>still thinking</analysis>".into(),
+            detail: None,
+        });
+        app.active = Some((1, CancellationToken::new()));
+
+        assert!(!app.transcript_source().contains("Question"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Preparing your first prompt"));
+
+        app.handle_response(
+            1,
+            ResponseEvent::Failed {
+                message: "failed".into(),
+            },
+        );
+        assert!(app.turns.is_empty());
+    }
+
+    #[test]
+    fn pending_follow_up_preserves_learner_detail_without_empty_assistant_heading() {
+        let mut app = test_app();
+        app.target = "problem".into();
+        app.turns.push(Turn {
+            label: "Follow-up".into(),
+            content: "<think>working</think>".into(),
+            detail: Some("my attempt".into()),
+        });
+        app.active = Some((1, CancellationToken::new()));
+
+        let source = app.transcript_source();
+        assert!(source.contains("You\nmy attempt"));
+        assert!(!source.contains("Follow-up"));
+    }
+
+    #[test]
+    fn cancel_removes_the_empty_pending_initial_turn() {
+        let mut app = test_app();
+        app.target = "problem".into();
+        app.turns.push(Turn {
+            label: "Question".into(),
+            content: String::new(),
+            detail: None,
+        });
+        app.active = Some((3, CancellationToken::new()));
+        app.handle_response(3, ResponseEvent::Cancelled);
+        assert!(app.turns.is_empty());
+        assert_eq!(app.status, "Cancelled");
+    }
+
+    #[test]
+    fn palette_filters_navigates_without_recursive_ctrl_p_and_escape_cancels_editor() {
+        let mut app = test_app();
+        app.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_popup_key(key(KeyCode::Char('t')));
+        assert!(matches!(&app.popup, Some(Popup::Palette { query, .. }) if query == "t"));
+        app.handle_popup_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(app.popup, Some(Popup::Palette { .. })));
+
+        let original = app.settings.base_url.clone();
+        app.open_setting(Command::Endpoint);
+        app.handle_popup_key(key(KeyCode::Char('x')));
+        app.handle_popup_key(key(KeyCode::Esc));
+        assert_eq!(app.settings.base_url, original);
+        assert!(matches!(app.popup, Some(Popup::Palette { .. })));
+    }
+
+    #[test]
+    fn palette_keyboard_navigation_query_editing_and_selection_preserve_semantics() {
+        let mut app = test_app();
+        app.open_palette();
+
+        for input in [
+            key(KeyCode::Down),
+            modified_key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('j')),
+            key(KeyCode::Char('k')),
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            modified_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            key(KeyCode::Up),
+        ] {
+            app.handle_palette_key(input);
+        }
+        assert!(matches!(
+            &app.popup,
+            Some(Popup::Palette { state, .. }) if state.selected() == Some(0)
+        ));
+
+        app.handle_palette_key(key(KeyCode::Char('x')));
+        app.handle_palette_key(key(KeyCode::Backspace));
+        app.handle_palette_key(modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_palette_key(key(KeyCode::Char('t')));
+        app.handle_palette_key(key(KeyCode::Char('h')));
+        app.handle_palette_key(key(KeyCode::Char('e')));
+        app.handle_palette_key(key(KeyCode::Char('m')));
+        app.handle_palette_key(key(KeyCode::Char('e')));
+        app.handle_palette_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Setting {
+                command: Command::Theme,
+                ..
+            })
+        ));
+
+        app.open_palette();
+        app.handle_palette_key(key(KeyCode::Esc));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn palette_commands_apply_local_actions_and_open_setting_editors() {
+        let mut app = test_app();
+        for command in [
+            Command::Provider,
+            Command::Protocol,
+            Command::Endpoint,
+            Command::ApiKey,
+            Command::Theme,
+            Command::LearningMode,
+        ] {
+            app.execute_command(command);
+            assert!(matches!(
+                app.popup,
+                Some(Popup::Setting { command: actual, .. }) if actual == command
+            ));
+        }
+
+        app.web_search = false;
+        app.execute_command(Command::WebSearch);
+        assert!(app.web_search);
+        assert!(app.popup.is_none());
+
+        app.execute_command(Command::Help);
+        assert_eq!(app.screen, Screen::Help);
+        app.turns.push(Turn {
+            label: "old".into(),
+            content: "answer".into(),
+            detail: None,
+        });
+        app.execute_command(Command::NewSession);
+        assert!(app.turns.is_empty());
+        app.execute_command(Command::Quit);
+        assert!(app.quit_requested);
+    }
+
+    #[test]
+    fn setting_drafts_map_each_palette_choice_without_persisting() {
+        let mut draft = SettingsDraft {
+            values: Settings::default(),
+            api_key: String::new(),
+        };
+        apply_setting_draft(&mut draft, Command::Provider, String::new(), Some(1));
+        apply_setting_draft(&mut draft, Command::Protocol, String::new(), Some(1));
+        apply_setting_draft(
+            &mut draft,
+            Command::Endpoint,
+            "https://example.test/v1".into(),
+            None,
+        );
+        apply_setting_draft(&mut draft, Command::ApiKey, "secret".into(), None);
+        apply_setting_draft(&mut draft, Command::Theme, String::new(), Some(2));
+        apply_setting_draft(&mut draft, Command::Help, "ignored".into(), None);
+
+        assert_eq!(draft.values.provider, Provider::Compatible);
+        assert_eq!(draft.values.protocol, Protocol::ChatCompletions);
+        assert_eq!(draft.values.base_url, "https://example.test/v1");
+        assert_eq!(draft.api_key, "secret");
+        assert_eq!(draft.values.theme, Theme::Macchiato);
+        assert_eq!(
+            selected_learning_mode(Command::LearningMode, Some(1)),
+            Some(LearningMode::WorkedExample)
+        );
+        assert_eq!(
+            selected_learning_mode(Command::LearningMode, Some(0)),
+            Some(LearningMode::Socratic)
+        );
+        assert_eq!(selected_learning_mode(Command::Theme, Some(1)), None);
+    }
+
+    #[test]
+    fn palette_and_setting_popups_render_choices_and_mask_api_keys() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = test_app();
+        for popup in [
+            Popup::Palette {
+                query: "theme".into(),
+                state: ListState::default(),
+            },
+            Popup::Setting {
+                command: Command::Theme,
+                draft: SettingsDraft {
+                    values: app.settings.clone(),
+                    api_key: String::new(),
+                },
+                input: String::new(),
+                state: ListState::default(),
+            },
+            Popup::Setting {
+                command: Command::ApiKey,
+                draft: SettingsDraft {
+                    values: app.settings.clone(),
+                    api_key: String::new(),
+                },
+                input: "hunter2".into(),
+                state: ListState::default(),
+            },
+        ] {
+            app.popup = Some(popup);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(!rendered.contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn session_title_is_high_contrast_in_every_theme_and_loading_panel_is_visible() {
+        for theme in [Theme::Latte, Theme::Frappe, Theme::Macchiato, Theme::Mocha] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let mut app = test_app();
+            app.settings.theme = theme;
+            app.mode = LearningMode::WorkedExample;
+            app.target = "problem".into();
+            app.turns.push(Turn {
+                label: "Worked example".into(),
+                content: String::new(),
+                detail: None,
+            });
+            app.active = Some((1, CancellationToken::new()));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rendered = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Preparing worked example"));
+            let session = buffer
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "S")
+                .expect("Session title");
+            assert_eq!(session.fg, palette(theme).text);
+            assert!(session.modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
     fn main_keys_drive_navigation_editing_and_session_controls() {
         let mut app = test_app();
         assert!(!app.handle_key(KeyEvent::new_with_kind(
@@ -2075,8 +2988,8 @@ mod tests {
         app.handle_main_key(key(KeyCode::F(3)));
         assert!(app.web_search);
         app.handle_main_key(key(KeyCode::F(4)));
-        assert_eq!(app.screen, Screen::Settings);
-        app.close_settings();
+        assert!(matches!(app.popup, Some(Popup::Palette { .. })));
+        app.popup = None;
 
         app.input = "ab".into();
         app.handle_main_key(key(KeyCode::Backspace));
@@ -2240,6 +3153,48 @@ mod tests {
         app.handle_popup_click(12, 11);
 
         assert_eq!(app.current_settings().model, "two");
+    }
+
+    #[test]
+    fn mouse_click_activates_palette_rows_with_list_offset() {
+        let mut app = test_app();
+        app.popup = Some(Popup::Palette {
+            query: String::new(),
+            state: ListState::default().with_offset(4),
+        });
+        app.popup_area = Rect::new(10, 10, 40, 10);
+
+        app.handle_popup_click(12, 11);
+
+        assert_eq!(app.screen, Screen::Main);
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Setting {
+                command: Command::ApiKey,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mouse_click_selects_setting_choice_with_list_offset() {
+        let mut app = test_app();
+        app.open_settings();
+        app.popup = Some(Popup::Setting {
+            command: Command::Theme,
+            draft: SettingsDraft {
+                values: app.settings.clone(),
+                api_key: String::new(),
+            },
+            input: String::new(),
+            state: ListState::default().with_offset(2),
+        });
+        app.popup_area = Rect::new(10, 10, 40, 10);
+
+        app.handle_popup_click(12, 11);
+
+        assert!(app.popup.is_none());
+        assert_eq!(app.current_settings().theme, Theme::Macchiato);
     }
 
     #[test]

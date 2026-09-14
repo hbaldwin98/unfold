@@ -24,7 +24,7 @@ pub fn label(action: LearningAction, mode: LearningMode) -> &'static str {
 pub fn previous_turns(turns: &[Turn]) -> Vec<PreviousTurn> {
     turns
         .iter()
-        .filter(|turn| !turn.content.trim().is_empty())
+        .filter(|turn| !visible_content(&turn.content).trim().is_empty())
         .map(|turn| PreviousTurn {
             label: turn.label.clone(),
             content: visible_content(&turn.content),
