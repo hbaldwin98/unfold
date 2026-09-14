@@ -5,12 +5,7 @@ mod secrets;
 mod sessions;
 mod settings;
 
-use std::{
-    collections::VecDeque,
-    io,
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, io, ops::Range, time::Duration};
 
 use arboard::Clipboard;
 use crossterm::{
@@ -46,8 +41,9 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 use url::Url;
 
-const ENTER_DELAY: Duration = Duration::from_millis(25);
 const MAX_TERMINAL_BATCH: usize = 256;
+const MIN_INPUT_HEIGHT: u16 = 4;
+const MAX_INPUT_HEIGHT: u16 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screen {
@@ -263,10 +259,13 @@ struct App {
     event_tx: mpsc::UnboundedSender<AppEvent>,
     status: String,
     viewport: Viewport,
+    input_viewport: Viewport,
     settings_field: usize,
     body_area: Rect,
+    input_area: Rect,
     popup_area: Rect,
     transcript_lines: usize,
+    input_lines: usize,
     selection: Option<(usize, usize)>,
     selection_anchor: usize,
     mouse_down: Option<(u16, u16)>,
@@ -276,8 +275,6 @@ struct App {
     force_quit_armed: bool,
     session_id: String,
     session_created_at: u64,
-    pending_enter: Option<Instant>,
-    unframed_paste: bool,
     persist_sessions: bool,
 }
 
@@ -320,10 +317,13 @@ impl App {
             event_tx,
             status: load_error.or(auth_status).unwrap_or_else(|| "Ready".into()),
             viewport: Viewport::new(),
+            input_viewport: Viewport::new(),
             settings_field: 0,
             body_area: Rect::default(),
+            input_area: Rect::default(),
             popup_area: Rect::default(),
             transcript_lines: 0,
+            input_lines: 1,
             selection: None,
             selection_anchor: 0,
             mouse_down: None,
@@ -333,8 +333,6 @@ impl App {
             force_quit_armed: false,
             session_id: uuid::Uuid::new_v4().to_string(),
             session_created_at: sessions::now(),
-            pending_enter: None,
-            unframed_paste: false,
             persist_sessions: true,
         }
     }
@@ -465,14 +463,17 @@ impl App {
         }
         if is_sessions_command(&self.input) {
             self.input.clear();
+            self.input_viewport = Viewport::new();
             self.open_sessions();
             return;
         }
         if self.turns.is_empty() {
             self.target = std::mem::take(&mut self.input);
+            self.input_viewport = Viewport::new();
             self.start(LearningAction::Initial, None);
         } else if !self.input.trim().is_empty() {
             let detail = Some(std::mem::take(&mut self.input));
+            self.input_viewport = Viewport::new();
             self.start(
                 if self.mode == LearningMode::Socratic {
                     LearningAction::SocraticResponse
@@ -490,6 +491,9 @@ impl App {
             return;
         }
         let detail = (!self.input.trim().is_empty()).then(|| std::mem::take(&mut self.input));
+        if detail.is_some() {
+            self.input_viewport = Viewport::new();
+        }
         self.start(action, detail);
     }
 
@@ -802,14 +806,9 @@ impl App {
             .map_or(&self.settings, |draft| &draft.values)
     }
 
-    #[cfg(test)]
     fn handle_event(&mut self, event: Event) -> bool {
-        self.handle_event_at(event, Instant::now())
-    }
-
-    fn handle_event_at(&mut self, event: Event, now: Instant) -> bool {
         match event {
-            Event::Key(key) => self.handle_key_at(key, now),
+            Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => {
                 self.handle_mouse(mouse);
                 false
@@ -822,19 +821,8 @@ impl App {
         }
     }
 
-    #[cfg(test)]
     fn handle_key(&mut self, key: KeyEvent) -> bool {
-        self.handle_key_at(key, Instant::now())
-    }
-
-    fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> bool {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return false;
-        }
-        if self.screen == Screen::Main
-            && self.popup.is_none()
-            && self.handle_pending_enter_key(key, now)
-        {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -874,44 +862,6 @@ impl App {
         false
     }
 
-    fn handle_pending_enter_key(&mut self, key: KeyEvent, now: Instant) -> bool {
-        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.pending_enter = None;
-            self.unframed_paste = false;
-            self.submit();
-            return true;
-        }
-        match key.code {
-            KeyCode::Char(character)
-                if self.pending_enter.is_some()
-                    && !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
-            {
-                self.pending_enter = None;
-                self.unframed_paste = true;
-                self.input.push('\n');
-                self.input.push(character);
-                true
-            }
-            KeyCode::Enter if self.pending_enter.is_some() && key.modifiers.is_empty() => {
-                self.pending_enter = None;
-                self.unframed_paste = true;
-                self.input.push_str("\n\n");
-                true
-            }
-            _ if self.pending_enter.is_some() => {
-                self.flush_pending_enter();
-                false
-            }
-            KeyCode::Enter if key.modifiers.is_empty() && !self.unframed_paste => {
-                self.pending_enter = Some(now + ENTER_DELAY);
-                true
-            }
-            _ => false,
-        }
-    }
-
     fn handle_main_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Left | KeyCode::Right)
@@ -934,6 +884,8 @@ impl App {
             }
             KeyCode::PageUp => self.scroll(-5),
             KeyCode::PageDown => self.scroll(5),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.scroll_input(-3),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.scroll_input(3),
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.viewport.offset = 0;
                 self.viewport.follow_tail = false;
@@ -943,16 +895,21 @@ impl App {
                 self.viewport
                     .clamp(self.transcript_lines, self.body_height());
             }
-            KeyCode::Enter if self.unframed_paste => self.input.push('\n'),
-            KeyCode::Enter => {}
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.push('\n');
+                self.follow_input_tail();
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => self.submit(),
             KeyCode::Backspace => {
                 self.input.pop();
+                self.follow_input_tail();
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.new_problem()
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.push(character)
+                self.input.push(character);
+                self.follow_input_tail();
             }
             _ => {}
         }
@@ -1216,6 +1173,7 @@ impl App {
             }
         } else if self.screen == Screen::Main && self.popup.is_none() {
             self.input.push_str(&clean);
+            self.follow_input_tail();
         }
     }
 
@@ -1273,6 +1231,16 @@ impl App {
             return;
         }
         match mouse.kind {
+            MouseEventKind::ScrollUp
+                if self.input_area.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.scroll_input(-3)
+            }
+            MouseEventKind::ScrollDown
+                if self.input_area.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.scroll_input(3)
+            }
             MouseEventKind::ScrollUp => self.scroll(-3),
             MouseEventKind::ScrollDown => self.scroll(3),
             MouseEventKind::Down(MouseButton::Left)
@@ -1380,6 +1348,20 @@ impl App {
             .scroll(delta, self.transcript_lines, self.body_height());
     }
 
+    fn scroll_input(&mut self, delta: isize) {
+        self.input_viewport
+            .scroll(delta, self.input_lines, self.input_height());
+    }
+
+    fn follow_input_tail(&mut self) {
+        self.input_viewport.follow_tail = true;
+        self.input_viewport.unseen = 0;
+    }
+
+    fn input_height(&self) -> usize {
+        usize::from(self.input_area.height.saturating_sub(2))
+    }
+
     fn body_height(&self) -> usize {
         usize::from(self.body_area.height.saturating_sub(2))
     }
@@ -1399,7 +1381,6 @@ impl App {
     }
 
     fn new_problem_with(&mut self, save: impl FnOnce(sessions::Session) -> Result<(), String>) {
-        self.flush_pending_enter();
         if let Err(error) = self.persist_session_with(save) {
             self.status = format!("Session save failed; new session cancelled: {error}");
             return;
@@ -1411,24 +1392,11 @@ impl App {
         self.input.clear();
         self.turns.clear();
         self.viewport = Viewport::new();
+        self.input_viewport = Viewport::new();
         self.selection = None;
         self.session_id = uuid::Uuid::new_v4().to_string();
         self.session_created_at = sessions::now();
-        self.unframed_paste = false;
         self.status = "New problem".into();
-    }
-
-    fn flush_pending_enter(&mut self) {
-        if self.pending_enter.take().is_some() {
-            self.unframed_paste = false;
-            self.submit();
-        }
-    }
-
-    fn flush_pending_enter_if_due(&mut self, now: Instant) {
-        if self.pending_enter.is_some_and(|deadline| now >= deadline) {
-            self.flush_pending_enter();
-        }
     }
 
     fn persist_session(&mut self) -> Result<(), String> {
@@ -1456,7 +1424,6 @@ impl App {
     }
 
     fn open_sessions(&mut self) {
-        self.flush_pending_enter();
         let (items, error) = match sessions::load() {
             Ok(items) => (items, None),
             Err(error) => (Vec::new(), Some(error)),
@@ -1542,8 +1509,7 @@ impl App {
         self.reconcile_web_search();
         self.turns = sessions::into_turns(&session);
         self.input.clear();
-        self.pending_enter = None;
-        self.unframed_paste = false;
+        self.input_viewport = Viewport::new();
         self.selection = None;
         self.viewport = Viewport::new();
         self.popup = None;
@@ -2222,6 +2188,15 @@ fn rendered_rows(text: Text<'static>, width: u16) -> usize {
         .line_count(width)
 }
 
+fn adaptive_input_height(terminal_height: u16, content_rows: usize) -> u16 {
+    let maximum = terminal_height
+        .saturating_sub(8)
+        .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
+    (content_rows.min(u16::MAX as usize) as u16)
+        .saturating_add(2)
+        .clamp(MIN_INPUT_HEIGHT, maximum)
+}
+
 fn fit_popup_line(value: &str, width: usize) -> String {
     let value = learning::strip_controls(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2489,14 +2464,22 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
+    let input_rows = text_layout(
+        &app.input,
+        usize::from(frame.area().width.saturating_sub(2)).max(1),
+    )
+    .rows
+    .len();
+    let input_height = adaptive_input_height(frame.area().height, input_rows);
     let [header, body, input, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
-        Constraint::Length(4),
+        Constraint::Length(input_height),
         Constraint::Length(2),
     ])
     .areas(frame.area());
     app.body_area = body;
+    app.input_area = input;
     let mode = if app.mode == LearningMode::Socratic {
         "SOCRATIC"
     } else {
@@ -2561,10 +2544,31 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
         body,
         &mut scrollbar,
     );
+    app.input_lines = text_layout(
+        &app.input,
+        usize::from(input.width.saturating_sub(2)).max(1),
+    )
+    .rows
+    .len();
+    app.input_viewport
+        .clamp(app.input_lines, app.input_height());
+    let position = format!(
+        "{}{}",
+        if app.input_viewport.offset > 0 {
+            " ↑"
+        } else {
+            ""
+        },
+        if app.input_viewport.offset + app.input_height() < app.input_lines {
+            " ↓"
+        } else {
+            ""
+        }
+    );
     let input_title = if app.turns.is_empty() {
-        " Problem / Enter start / Ctrl+Enter multiline "
+        format!(" Problem / Enter start / Ctrl+Enter newline{position} ")
     } else {
-        " Response / Enter send / Ctrl+Enter multiline "
+        format!(" Response / Enter send / Ctrl+Enter newline{position} ")
     };
     frame.render_widget(
         Paragraph::new(app.input.as_str())
@@ -2574,7 +2578,8 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
                     .title(input_title)
                     .border_style(Style::new().fg(colors.accent)),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((app.input_viewport.offset.min(u16::MAX as usize) as u16, 0)),
         input,
     );
     let spinner = if app.active.is_some() {
@@ -2596,7 +2601,7 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
                 Span::raw(app.status.as_str()),
             ]),
             Line::styled(
-                "Ctrl+P commands  /sessions history  Ctrl+Enter multiline send  F1 help  Ctrl+Q quit",
+                "Enter send  Ctrl+Enter newline  Alt+Up/Down input scroll  F1 help  Ctrl+Q quit",
                 Style::new().fg(colors.text),
             ),
         ])),
@@ -2655,7 +2660,7 @@ fn render_settings(frame: &mut Frame, app: &App, colors: Palette) {
 }
 
 fn render_help(frame: &mut Frame, colors: Palette) {
-    let help = "KEYBOARD\nCtrl+P or F4  Search commands and configuration\nPalette/pickers: type to filter; arrows, j/k, Ctrl+N/P, or Ctrl+J/K navigate; Enter confirms; Esc cancels\nEnter  Start/send after paste detection, add newline in unframed paste, or confirm dialog\nCtrl+Enter  Submit a multiline draft immediately\n/sessions  Browse and continue saved sessions (exact main-input command)\nEsc  Cancel response or close dialog\nTab or F2  Mode before session\nF3  Web search\nF5  Another hint\nF8 or Ctrl+M  Model and reasoning picker\nF9/F10/F12  Explain/check/reveal\nPgUp/PgDn or mouse wheel  Scroll\nCtrl+Home/End  Top/follow latest\nShift+Left/Right  Extend transcript selection\nCtrl+C/Ctrl+V  Copy selection/paste into text editors\nCtrl+N  Save and start a new problem (outside palette)\nCtrl+Q  Save and quit\n\nMOUSE\nWheel scrolls. Drag selects transcript text. Click an http/https link to open it. Click palette and dialog choices to activate them.\n\nPress any key to return.";
+    let help = "KEYBOARD\nCtrl+P or F4  Search commands and configuration\nPalette/pickers: type to filter; arrows, j/k, Ctrl+N/P, or Ctrl+J/K navigate; Enter confirms; Esc cancels\nEnter  Start or send immediately\nCtrl+Enter  Insert a newline in the main input\nAlt+Up/Down  Scroll the main input without editing it\n/sessions  Browse and continue saved sessions (exact main-input command)\nEsc  Cancel response or close dialog\nTab or F2  Mode before session\nF3  Web search\nF5  Another hint\nF8 or Ctrl+M  Model and reasoning picker\nF9/F10/F12  Explain/check/reveal\nPgUp/PgDn  Scroll transcript\nCtrl+Home/End  Transcript top/follow latest\nShift+Left/Right  Extend transcript selection\nCtrl+C/Ctrl+V  Copy selection/paste atomically into text editors\nCtrl+N  Save and start a new problem (outside palette)\nCtrl+Q  Save and quit\n\nMOUSE\nWheel over the input scrolls the input; elsewhere it scrolls the transcript. Drag selects transcript text. Click an http/https link to open it. Click palette and dialog choices to activate them.\n\nPress any key to return.";
     frame.render_widget(
         Paragraph::new(help)
             .style(Style::new().fg(colors.text))
@@ -2936,7 +2941,6 @@ async fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
     loop {
         if run_frame(terminal, &mut app)? {
-            app.flush_pending_enter();
             app.cancel();
             break;
         }
@@ -2947,29 +2951,19 @@ async fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
 fn run_frame(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
     app.tick = app.tick.wrapping_add(1);
     drain_events(app);
-    app.flush_pending_enter_if_due(Instant::now());
     terminal.draw(|frame| render(frame, app))?;
-    let Some((batch_time, first_event)) = wait_for_terminal_event(terminal_timeout(app))? else {
-        app.flush_pending_enter_if_due(Instant::now());
+    let Some(first_event) = wait_for_terminal_event(Duration::from_millis(50))? else {
         return Ok(false);
     };
     let events = read_queued_terminal_events(first_event)?;
-    Ok(process_terminal_batch(app, events, batch_time))
+    Ok(process_terminal_batch(app, events))
 }
 
-fn terminal_timeout(app: &App) -> Duration {
-    app.pending_enter
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-        .unwrap_or(Duration::from_millis(50))
-        .min(Duration::from_millis(50))
-}
-
-fn wait_for_terminal_event(timeout: Duration) -> io::Result<Option<(Instant, Event)>> {
+fn wait_for_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
     if !event::poll(timeout)? {
         return Ok(None);
     }
-    let batch_time = Instant::now();
-    Ok(Some((batch_time, event::read()?)))
+    Ok(Some(event::read()?))
 }
 
 fn read_queued_terminal_events(first_event: Event) -> io::Result<Vec<Event>> {
@@ -2980,16 +2974,11 @@ fn read_queued_terminal_events(first_event: Event) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
-fn process_terminal_batch(
-    app: &mut App,
-    events: impl IntoIterator<Item = Event>,
-    batch_time: Instant,
-) -> bool {
+fn process_terminal_batch(app: &mut App, events: impl IntoIterator<Item = Event>) -> bool {
     let mut quit = false;
     for event in events.into_iter().take(MAX_TERMINAL_BATCH) {
-        quit |= app.handle_event_at(event, batch_time);
+        quit |= app.handle_event(event);
     }
-    app.flush_pending_enter_if_due(batch_time);
     quit
 }
 
@@ -3069,10 +3058,13 @@ mod tests {
             event_tx,
             status: "Ready".into(),
             viewport: Viewport::new(),
+            input_viewport: Viewport::new(),
             settings_field: 0,
             body_area: Rect::new(0, 0, 80, 20),
+            input_area: Rect::new(0, 20, 80, 6),
             popup_area: Rect::default(),
             transcript_lines: 100,
+            input_lines: 1,
             selection: None,
             selection_anchor: 0,
             mouse_down: None,
@@ -3082,8 +3074,6 @@ mod tests {
             force_quit_armed: false,
             session_id: "test-session".into(),
             session_created_at: 1,
-            pending_enter: None,
-            unframed_paste: false,
             persist_sessions: false,
         }
     }
@@ -3397,83 +3387,43 @@ mod tests {
     }
 
     #[test]
-    fn unframed_multiline_paste_is_coalesced_into_one_draft() {
+    fn multiline_paste_follows_tail_and_input_scroll_clamps() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 18)).unwrap();
         let mut app = test_app();
-        for code in [
-            KeyCode::Char('a'),
-            KeyCode::Enter,
-            KeyCode::Char('b'),
-            KeyCode::Enter,
-        ] {
-            app.handle_key(key(code));
-        }
-        assert_eq!(app.input, "a\nb\n");
-        assert!(app.turns.is_empty());
-        assert!(app.active.is_none());
+        app.handle_event(Event::Paste(
+            (1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(app.input_viewport.offset > 0);
+        assert!(app.input_viewport.follow_tail);
+        let tail = app.input_viewport.offset;
+        app.scroll_input(-3);
+        assert!(app.input_viewport.offset < tail);
+        assert!(!app.input_viewport.follow_tail);
+        app.scroll_input(isize::MAX);
+        assert_eq!(app.input_viewport.offset, tail);
+        assert!(app.input_viewport.follow_tail);
     }
 
     #[test]
-    fn shifted_printable_keys_continue_an_unframed_paste() {
-        let mut app = test_app();
-        app.input = "before".into();
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(modified_key(KeyCode::Char('A'), KeyModifiers::SHIFT));
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(modified_key(KeyCode::Char('!'), KeyModifiers::SHIFT));
-
-        assert_eq!(app.input, "before\nA\n!");
-        assert!(app.unframed_paste);
-        assert!(app.turns.is_empty());
+    fn adaptive_input_layout_grows_without_starving_transcript() {
+        assert_eq!(adaptive_input_height(30, 1), MIN_INPUT_HEIGHT);
+        assert_eq!(adaptive_input_height(30, 20), MAX_INPUT_HEIGHT);
+        assert_eq!(adaptive_input_height(12, 20), 4);
     }
 
     #[tokio::test]
-    async fn command_modifiers_do_not_continue_an_unframed_paste() {
-        for modifiers in [
-            KeyModifiers::CONTROL,
-            KeyModifiers::ALT,
-            KeyModifiers::SUPER,
-        ] {
-            let mut app = test_app();
-            app.input = "problem".into();
-            app.handle_key(key(KeyCode::Enter));
-            app.handle_key(modified_key(KeyCode::Char('X'), modifiers));
-
-            assert_eq!(app.target, "problem");
-            assert!(app.active.is_some());
-            assert!(!app.unframed_paste);
-        }
-    }
-
-    #[tokio::test]
-    async fn ordinary_enter_submits_once_after_deadline() {
+    async fn ordinary_enter_submits_immediately() {
         let mut app = test_app();
         app.input = "problem".into();
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.turns.is_empty());
-        app.flush_pending_enter_if_due(Instant::now() + ENTER_DELAY);
         assert_eq!(app.turns.len(), 1);
         assert_eq!(app.target, "problem");
         assert!(app.active.is_some());
-    }
-
-    #[tokio::test]
-    async fn queued_terminal_burst_uses_one_arrival_time_across_render_delay() {
-        let mut app = test_app();
-        let arrival = Instant::now();
-        let events = [
-            Event::Key(key(KeyCode::Char('a'))),
-            Event::Key(key(KeyCode::Enter)),
-            Event::Key(key(KeyCode::Char('b'))),
-            Event::Key(key(KeyCode::Enter)),
-            Event::Key(key(KeyCode::Char('c'))),
-        ];
-
-        assert!(!process_terminal_batch(&mut app, events, arrival));
-        app.flush_pending_enter_if_due(arrival + ENTER_DELAY + Duration::from_secs(1));
-
-        assert_eq!(app.input, "a\nb\nc");
-        assert!(app.turns.is_empty());
-        assert!(app.active.is_none());
     }
 
     #[test]
@@ -3481,45 +3431,36 @@ mod tests {
         let mut app = test_app();
         let events = (0..MAX_TERMINAL_BATCH + 10).map(|_| Event::Key(key(KeyCode::Char('x'))));
 
-        assert!(!process_terminal_batch(&mut app, events, Instant::now()));
+        assert!(!process_terminal_batch(&mut app, events));
 
         assert_eq!(app.input.len(), MAX_TERMINAL_BATCH);
     }
 
-    #[tokio::test]
-    async fn control_enter_explicitly_submits_multiline_draft() {
+    #[test]
+    fn control_enter_inserts_newline_without_submitting() {
         let mut app = test_app();
-        app.input = "line one\nline two\n".into();
-        app.unframed_paste = true;
+        app.input = "line one".into();
         app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
-        assert_eq!(app.target, "line one\nline two\n");
-        assert_eq!(app.turns.len(), 1);
-        assert!(!app.unframed_paste);
+        assert_eq!(app.input, "line one\n");
+        assert!(app.target.is_empty());
+        assert!(app.turns.is_empty());
     }
 
     #[test]
-    fn submit_during_generation_keeps_draft_for_enter_and_control_enter() {
-        for control in [false, true] {
-            let mut app = test_app();
-            app.target = "problem".into();
-            app.input = "draft answer".into();
-            app.turns.push(Turn {
-                label: "First question".into(),
-                content: "Question".into(),
-                detail: None,
-                sources: Vec::new(),
-            });
-            app.active = Some(active(1, LearningAction::Initial));
-            let modifiers = if control {
-                KeyModifiers::CONTROL
-            } else {
-                KeyModifiers::NONE
-            };
-            app.handle_key_at(modified_key(KeyCode::Enter, modifiers), Instant::now());
-            app.flush_pending_enter_if_due(Instant::now() + ENTER_DELAY);
-            assert_eq!(app.input, "draft answer");
-            assert_eq!(app.turns.len(), 1);
-        }
+    fn submit_during_generation_keeps_draft() {
+        let mut app = test_app();
+        app.target = "problem".into();
+        app.input = "draft answer".into();
+        app.turns.push(Turn {
+            label: "First question".into(),
+            content: "Question".into(),
+            detail: None,
+            sources: Vec::new(),
+        });
+        app.active = Some(active(1, LearningAction::Initial));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "draft answer");
+        assert_eq!(app.turns.len(), 1);
     }
 
     #[test]
@@ -3837,6 +3778,34 @@ mod tests {
         assert_eq!(app.mouse_down, Some((2, 2)));
         assert!(app.mouse_dragged);
         assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn mouse_wheel_routes_between_input_and_transcript() {
+        let mut app = test_app();
+        app.viewport.offset = 80;
+        app.input_lines = 20;
+        app.input_viewport.clamp(20, app.input_height());
+        let transcript_offset = app.viewport.offset;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: app.input_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.input_viewport.offset < 16);
+        assert_eq!(app.viewport.offset, transcript_offset);
+
+        let input_offset = app.input_viewport.offset;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.input_viewport.offset, input_offset);
+        assert_eq!(app.viewport.offset, transcript_offset - 3);
     }
 
     #[test]

@@ -63,7 +63,7 @@ The ChatGPT integration uses a private backend intended for Codex-capable client
 4. Press `Ctrl+N` outside the palette to save the current session and start another problem.
 5. Enter the exact command `/sessions`, or choose **Browse sessions**, to restore a saved session. Continuation sends its visible prior turns using the currently configured provider and model.
 
-An ordinary `Enter` is held for 25 ms so terminals without bracketed-paste support can deliver `Char`, `Enter`, `Char` bursts as one multiline draft. Unfold drains up to 256 immediately queued terminal events as one timestamped batch before redrawing or resolving that deadline, so rendering time cannot submit midway through an already queued burst. Once detected, Enter characters remain newlines, including the final newline; press `Ctrl+Enter` to submit that multiline draft. Bracketed paste and `Ctrl+V` remain atomic and do not need this fallback. Bursts beyond the batch limit may be split to prevent input starvation.
+`Enter` submits immediately. Use `Ctrl+Enter` to insert a newline in the main input. Bracketed paste events and `Ctrl+V` insert sanitized multiline text atomically.
 
 Choose the mode before the first turn with `Tab`, `F2`, or **Choose learning mode**. The mode is locked after the first turn; pressing `Tab` or `F2` then reports the lock instead of changing the session. Start a new session to change it.
 
@@ -103,8 +103,9 @@ The palette contains exactly these 14 commands:
 
 | Key | Scope and action |
 | --- | --- |
-| `Enter` | Start/send after a 25 ms paste-detection delay, insert a newline in a detected unframed paste, or confirm a dialog |
-| `Ctrl+Enter` | Submit a multiline main-input draft immediately |
+| `Enter` | Start or send immediately on the main screen; confirm a dialog elsewhere |
+| `Ctrl+Enter` | Insert a newline in the main input without submitting |
+| `Alt+Up` / `Alt+Down` | Scroll the wrapped main input without moving or editing text |
 | `F1` | Open help from the main screen; any key closes help |
 | `Tab` or `F2` | Toggle mode on the main screen before the first turn; report that mode is locked after the session starts |
 | `F3` | Toggle web search on the main screen |
@@ -118,7 +119,7 @@ The palette contains exactly these 14 commands:
 | `F12` | Reveal the Socratic solution after the first turn |
 | `Esc` | Cancel active generation and clear selection on the main screen; close a palette/model dialog; return a setting dialog to the palette without saving |
 | `PageUp` / `PageDown` | Scroll five rendered rows |
-| Mouse wheel | Scroll three rendered rows |
+| Mouse wheel | Scroll three input rows when over the input; otherwise scroll three transcript rows |
 | `Ctrl+Home` / `Ctrl+End` | Jump to the top / resume following the latest output |
 | `Shift+Left` / `Shift+Right` | Extend the transcript selection by one rendered character |
 | `Ctrl+C` | Copy only when transcript text is selected; it does not quit the app |
@@ -130,6 +131,8 @@ The palette contains exactly these 14 commands:
 ## Scrolling And Loading
 
 Streaming follows the tail until you scroll upward. While follow-tail is off, the session title counts newly added **wrapped display rows**, not source lines or tokens. Scrolling back to the bottom or pressing `Ctrl+End` resumes follow-tail and clears the count. Rewrapping after a terminal resize updates row counts and clamps the viewport.
+
+The main input grows from 4 to 12 rows as space and content permit while preserving transcript space. It follows the wrapped-text tail after typing, backspace, paste, or newline insertion. `Alt+Up`/`Alt+Down` and the mouse wheel over the input scroll it without changing the draft; arrows in the input title show hidden content above or below.
 
 Before a new turn has visible text, Unfold shows a compact inline status for the active action, such as asking the next question, checking an attempt, or preparing a worked example. It does not clear or cover the transcript or learner detail. Hidden reasoning, source events, and other metadata do not dismiss it; only nonempty sanitized visible text does. The footer spinner remains active throughout generation. Completion, cancellation, and failures update the status, and an empty pending assistant turn is removed.
 
@@ -144,7 +147,7 @@ Unfold enables mouse capture, focus events, and bracketed paste while it runs an
 - `Ctrl+C` copies the selected rendered projection only. With no selection, it reports that nothing is selected.
 - `Ctrl+V` and terminal paste events affect editors only; they do not mutate choice lists or settings behind a popup.
 - Paste strips terminal control sequences and normalizes CRLF and CR line endings to LF before insertion.
-- Terminals that do not emit bracketed paste are detected from a rapid printable-key burst after Enter. The full burst remains a draft until `Ctrl+Enter` explicitly submits it.
+- Multiline bracketed paste and `Ctrl+V` are inserted as one sanitized edit; paste never changes `Enter` submission behavior.
 
 ## Markdown Rendering
 
