@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 arboard = { version = "3.6", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 crossterm = "0.29"
 directories = "6"
 futures-util = "0.3"
