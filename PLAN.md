@@ -6,12 +6,12 @@ Unfold is one Rust binary with an immediate-mode Ratatui interface. A learner en
 
 Socratic sessions support free-form answers, another hint, a focused step explanation, attempt checking, and an explicit solution reveal. Worked Example sessions produce a complete solution and accept free-form questions afterward. Web search is optional and is unavailable for Chat Completions.
 
-The terminal has one event owner. Provider and OAuth tasks report through Tokio channels; generation IDs reject stale events. `CancellationToken` stops active streams. Ratatui initialization and restoration cover normal and returned-error paths.
+The terminal has one event owner. Provider, catalog, and OAuth tasks report through structured Tokio channel events; operation IDs reject stale results. `CancellationToken` stops active streams. Ratatui initialization and restoration cover raw mode, mouse capture, focus reporting, and bracketed paste on normal and returned-error paths.
 
 ## Architecture
 
 - Root binary crate in `src/`
-- `main.rs`: event loop, state, key routing, rendering, and service orchestration
+- `main.rs`: event loop, transactional settings draft, bounded follow-tail viewport, Markdown rendering, popup/list state, selection, key/mouse routing, and service orchestration
 - `provider.rs`: request construction, model catalogs, bounded SSE parsing, and normalized `ResponseEvent`
 - `auth.rs`: ChatGPT PKCE login, callback, token exchange, and refresh
 - `secrets.rs`: Windows-native keyring storage using service `com.workedexamples.desktop`
@@ -34,14 +34,16 @@ No Node, browser frontend, WebView, Tauri command, installer, or transcript data
 
 - The release binary starts in an actionable problem-input state.
 - All learning modes/actions, settings, auth, catalog refresh, cancellation, scrolling, new problem, help, and quit are keyboard reachable.
-- Responses stream while the terminal remains responsive.
+- Responses stream while the terminal remains responsive and follow the viewport unless the learner scrolls up.
+- Model discovery retains model-specific reasoning metadata and supports an unsaved draft API key.
+- Keyboard and mouse users can operate dialogs, scroll, select, copy, and paste.
 - Previous turns are supplied without hidden metadata or controls.
 - Terminal state is restored after normal exit and recoverable errors.
 - `fmt`, tests, warning-denying Clippy, locked release build, `cargo audit`, and whitespace checks pass in root CI.
 
 ## Limits
 
-- Markdown and mathematics are displayed as plain terminal text.
+- Markdown headings, lists, quotes, and fenced code are styled; terminal rendering does not typeset LaTeX.
 - Source URLs are displayed but are not interactive.
-- The model catalog is shown in the status text; custom model IDs are entered in Settings.
+- Selection is app-managed text selection rather than the terminal emulator's native selection.
 - Sessions are intentionally memory-only.

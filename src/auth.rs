@@ -54,7 +54,7 @@ pub fn status() -> Result<AuthStatus, String> {
 pub async fn start_login() -> Result<
     (
         String,
-        tokio::sync::oneshot::Receiver<Result<AuthStatus, String>>,
+        tokio::sync::oneshot::Receiver<Result<OAuthCredentials, String>>,
     ),
     String,
 > {
@@ -84,10 +84,7 @@ pub async fn start_login() -> Result<
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = receive_callback(listeners, &state, &verifier).await;
-        let _ = sender.send(result.map(|credentials| AuthStatus {
-            signed_in: true,
-            email: credentials.email,
-        }));
+        let _ = sender.send(result);
     });
 
     Ok((auth_url.to_string(), receiver))
@@ -235,9 +232,7 @@ async fn process_callback(
         .find(|(key, _)| key == "code")
         .map(|(_, value)| value.into_owned())
         .ok_or_else(|| "ChatGPT did not return an authorization code".to_owned())?;
-    let credentials = exchange_code(&code, verifier).await?;
-    secrets::save_oauth(&credentials)?;
-    Ok(credentials)
+    exchange_code(&code, verifier).await
 }
 
 async fn write_callback_response(

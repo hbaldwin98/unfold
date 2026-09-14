@@ -95,6 +95,13 @@ pub struct ReasoningOption {
     pub description: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialOverride {
+    Unchanged,
+    Clear,
+    Replace(String),
+}
+
 #[derive(Deserialize)]
 struct ChatgptModelsResponse {
     models: Vec<ChatgptModel>,
@@ -154,13 +161,18 @@ fn validate_search_support(settings: &Settings, web_search: bool) -> Result<(), 
     }
 }
 
-pub async fn list_models(settings: Settings) -> Result<Vec<ModelOption>, String> {
-    settings.validate()?;
+pub async fn list_models(
+    settings: Settings,
+    credential: CredentialOverride,
+) -> Result<Vec<ModelOption>, String> {
+    settings.validate_provider()?;
     let client = provider_client()?;
 
     match settings.provider {
         Provider::Chatgpt => list_chatgpt_models(&client).await,
-        Provider::Compatible => list_compatible_models(&client, &settings.base_url).await,
+        Provider::Compatible => {
+            list_compatible_models(&client, &settings.base_url, credential).await
+        }
     }
 }
 
@@ -204,8 +216,9 @@ async fn list_chatgpt_models(client: &Client) -> Result<Vec<ModelOption>, String
 async fn list_compatible_models(
     client: &Client,
     base_url: &str,
+    credential: CredentialOverride,
 ) -> Result<Vec<ModelOption>, String> {
-    let api_key = secrets::load_api_key()?;
+    let api_key = compatible_api_key(credential)?;
     let mut builder = client.get(endpoint_url(base_url, "models"));
     if let Some(api_key) = api_key {
         builder = builder.bearer_auth(api_key);
@@ -217,7 +230,26 @@ async fn list_compatible_models(
             .data;
     models.sort_by(|left, right| left.id.cmp(&right.id));
 
-    Ok(models
+    Ok(compatible_model_options(models))
+}
+
+fn compatible_api_key(credential: CredentialOverride) -> Result<Option<String>, String> {
+    compatible_api_key_with(credential, secrets::load_api_key)
+}
+
+fn compatible_api_key_with(
+    credential: CredentialOverride,
+    load: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    match credential {
+        CredentialOverride::Unchanged => load(),
+        CredentialOverride::Clear => Ok(None),
+        CredentialOverride::Replace(value) => Ok(Some(value)),
+    }
+}
+
+fn compatible_model_options(models: Vec<CompatibleModel>) -> Vec<ModelOption> {
+    models
         .into_iter()
         .map(|model| ModelOption {
             name: model.id.clone(),
@@ -226,7 +258,7 @@ async fn list_compatible_models(
             default_reasoning_effort: None,
             reasoning_efforts: Vec::new(),
         })
-        .collect())
+        .collect()
 }
 
 async fn send_request(
@@ -953,6 +985,26 @@ mod tests {
         assert_eq!(chat.get("reasoning_effort"), Some(&json!("medium")));
         assert!(chat.get("tools").is_none());
         assert_eq!(compatible_path(settings.protocol), "chat/completions");
+    }
+
+    #[test]
+    fn credential_override_distinguishes_persisted_clear_and_replace() {
+        let persisted = || Ok(Some("stored".to_owned()));
+        assert_eq!(
+            compatible_api_key_with(CredentialOverride::Unchanged, persisted).unwrap(),
+            Some("stored".to_owned())
+        );
+        assert_eq!(
+            compatible_api_key_with(CredentialOverride::Clear, || panic!("must not load")).unwrap(),
+            None
+        );
+        assert_eq!(
+            compatible_api_key_with(CredentialOverride::Replace("draft".to_owned()), || panic!(
+                "must not load"
+            ))
+            .unwrap(),
+            Some("draft".to_owned())
+        );
     }
 
     #[test]

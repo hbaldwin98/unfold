@@ -1,6 +1,6 @@
 # Unfold
 
-Unfold is a keyboard-only Rust terminal application for guided Socratic practice and complete worked examples. It streams responses from ChatGPT subscription access or an OpenAI-compatible endpoint.
+Unfold is a Rust terminal application for guided Socratic practice and complete worked examples. It streams Markdown-formatted responses from ChatGPT subscription access or an OpenAI-compatible endpoint.
 
 ## Build And Run
 
@@ -18,19 +18,25 @@ Non-secret settings are stored in the operating system configuration directory. 
 - `F1`: help
 - `F2`: switch Socratic/Worked Example mode before starting
 - `F3`: toggle provider web search
-- `F4`: edit provider, protocol, URL, model, reasoning, and API key
+- `F4`: edit provider, protocol, URL, model, reasoning, theme, and API key
 - `F5`: another Socratic hint
 - `F6` / `F7`: ChatGPT browser login / logout
-- `F8`: refresh and display the provider model catalog
+- `F8` / `Ctrl+M`: open the provider model catalog, then choose supported reasoning effort
 - `F9`: explain the step typed in the input
 - `F10`: check the attempt typed in the input
 - `F12`: reveal the Socratic solution
 - `Esc`: cancel generation
-- `PageUp` / `PageDown`: scroll the response
+- `PageUp` / `PageDown` or mouse wheel: scroll; streaming follows the bottom until you scroll up
+- `Ctrl+Home` / `Ctrl+End`: jump to the top / resume following streamed output
+- `Shift+Left` / `Shift+Right`: extend the transcript selection
+- Mouse drag: select transcript text
+- `Ctrl+C` / `Ctrl+V`: copy selected text / paste into the active editor
 - `Ctrl+N`: clear the in-memory session and start a new problem
 - `Ctrl+Q`: quit
 
-In Settings, use `Tab`/`Shift+Tab` to select a field, arrows to cycle choices, type to edit text fields, and `F2` to save. Enter `CLEAR` in the API key field to remove the stored key; an empty field leaves it unchanged.
+In Settings, use `Tab`/`Shift+Tab` to select a field, arrows to cycle choices, type to edit text fields, and `Enter` or `F2` to save. Press `Enter` on Model to open the catalog. `Esc` discards the complete draft. Enter `CLEAR` in the API key field to remove the stored key; an empty field leaves it unchanged. Catppuccin Latte, Frappe, Macchiato, and Mocha themes persist with the other non-secret settings.
+
+Bracketed paste, focus events, and mouse capture are enabled while Unfold runs and disabled during terminal restoration. Pasted and copied transcript content passes through the same terminal-control sanitization as provider output.
 
 ## Verification
 

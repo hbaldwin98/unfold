@@ -12,6 +12,18 @@ pub struct Settings {
     pub model: String,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub theme: Theme,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    Latte,
+    Frappe,
+    Macchiato,
+    #[default]
+    Mocha,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -65,6 +77,7 @@ impl Default for Settings {
             base_url: "http://localhost:11434".to_owned(),
             model: "gpt-5.4-mini".to_owned(),
             reasoning_effort: ReasoningEffort::Default,
+            theme: Theme::Mocha,
         }
     }
 }
@@ -75,6 +88,10 @@ impl Settings {
             return Err("Model is required".to_owned());
         }
 
+        self.validate_provider()
+    }
+
+    pub fn validate_provider(&self) -> Result<(), String> {
         if self.provider == Provider::Compatible {
             let url = url::Url::parse(self.base_url.trim())
                 .map_err(|_| "Endpoint must be a valid URL".to_owned())?;
