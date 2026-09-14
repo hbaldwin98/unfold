@@ -2,9 +2,15 @@ mod auth;
 mod learning;
 mod provider;
 mod secrets;
+mod sessions;
 mod settings;
 
-use std::{io, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use arboard::Clipboard;
 use crossterm::{
@@ -19,6 +25,7 @@ use learning::Turn;
 use provider::{
     CredentialOverride, GenerateRequest, LearningAction, LearningMode, ModelOption, ResponseEvent,
 };
+use pulldown_cmark::{Event as MarkdownEvent, Parser, Tag, TagEnd};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
@@ -36,6 +43,11 @@ use ratatui_markdown::{
 use settings::{Protocol, Provider, ReasoningEffort, Settings, Theme};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthChar;
+use url::Url;
+
+const ENTER_DELAY: Duration = Duration::from_millis(25);
+const MAX_TERMINAL_BATCH: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screen {
@@ -117,6 +129,12 @@ enum Popup {
         model: ModelOption,
         state: ListState,
     },
+    Sessions {
+        query: String,
+        state: ListState,
+        sessions: Vec<sessions::Session>,
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,12 +150,13 @@ enum Command {
     Login,
     Logout,
     NewSession,
+    Sessions,
     Help,
     Quit,
 }
 
 impl Command {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Model,
         Self::Provider,
         Self::Protocol,
@@ -149,6 +168,7 @@ impl Command {
         Self::Login,
         Self::Logout,
         Self::NewSession,
+        Self::Sessions,
         Self::Help,
         Self::Quit,
     ];
@@ -166,6 +186,7 @@ impl Command {
             Self::Login => "Log in to ChatGPT",
             Self::Logout => "Log out of ChatGPT",
             Self::NewSession => "New session",
+            Self::Sessions => "Browse sessions",
             Self::Help => "Help",
             Self::Quit => "Quit",
         }
@@ -178,6 +199,51 @@ enum AppEvent {
     Login(u64, Result<secrets::OAuthCredentials, String>),
 }
 
+struct ActiveGeneration {
+    id: u64,
+    cancellation: CancellationToken,
+    action: LearningAction,
+    visible_text_started: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptLink {
+    range: Range<usize>,
+    url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkHitbox {
+    row: u16,
+    start_column: u16,
+    end_column: u16,
+    url: String,
+}
+
+struct RenderedTranscript {
+    text: Text<'static>,
+    plain: String,
+    links: Vec<TranscriptLink>,
+}
+
+#[derive(Clone, Copy)]
+struct LayoutUnit {
+    index: usize,
+    width: usize,
+    whitespace: bool,
+}
+
+struct WrappedRow {
+    cells: Vec<LayoutUnit>,
+    start: usize,
+    end: usize,
+}
+
+struct TextLayout {
+    rows: Vec<WrappedRow>,
+    text_len: usize,
+}
+
 struct App {
     settings: Settings,
     settings_draft: Option<SettingsDraft>,
@@ -188,7 +254,7 @@ struct App {
     mode: LearningMode,
     web_search: bool,
     turns: Vec<Turn>,
-    active: Option<(u64, CancellationToken)>,
+    active: Option<ActiveGeneration>,
     generation: u64,
     tick: u64,
     operation_id: u64,
@@ -203,7 +269,16 @@ struct App {
     transcript_lines: usize,
     selection: Option<(usize, usize)>,
     selection_anchor: usize,
+    mouse_down: Option<(u16, u16)>,
+    mouse_dragged: bool,
+    link_hitboxes: Vec<LinkHitbox>,
     quit_requested: bool,
+    force_quit_armed: bool,
+    session_id: String,
+    session_created_at: u64,
+    pending_enter: Option<Instant>,
+    unframed_paste: bool,
+    persist_sessions: bool,
 }
 
 impl App {
@@ -251,7 +326,16 @@ impl App {
             transcript_lines: 0,
             selection: None,
             selection_anchor: 0,
+            mouse_down: None,
+            mouse_dragged: false,
+            link_hitboxes: Vec::new(),
             quit_requested: false,
+            force_quit_armed: false,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            session_created_at: sessions::now(),
+            pending_enter: None,
+            unframed_paste: false,
+            persist_sessions: true,
         }
     }
 
@@ -267,7 +351,12 @@ impl App {
         self.generation += 1;
         let id = self.generation;
         let cancellation = CancellationToken::new();
-        self.active = Some((id, cancellation.clone()));
+        self.active = Some(ActiveGeneration {
+            id,
+            cancellation: cancellation.clone(),
+            action,
+            visible_text_started: false,
+        });
         let settings = self.settings.clone();
         let request = GenerateRequest {
             target: self.target.clone(),
@@ -281,6 +370,7 @@ impl App {
             label: learning::label(action, self.mode).to_owned(),
             content: String::new(),
             detail,
+            sources: Vec::new(),
         });
         let output = self.event_tx.clone();
         tokio::spawn(async move {
@@ -303,23 +393,31 @@ impl App {
     }
 
     fn handle_response(&mut self, id: u64, event: ResponseEvent) {
-        if self.active.as_ref().map(|active| active.0) != Some(id) {
+        if self.active.as_ref().map(|active| active.id) != Some(id) {
             return;
         }
         match event {
             ResponseEvent::Started => self.status = "Streaming response...".into(),
             ResponseEvent::TextDelta { delta } => {
                 let before = self.transcript_display_rows();
+                let clean = learning::strip_controls(&delta);
+                if !learning::visible_content(&clean).trim().is_empty()
+                    && let Some(active) = &mut self.active
+                {
+                    active.visible_text_started = true;
+                }
                 if let Some(turn) = self.turns.last_mut() {
-                    turn.content.push_str(&learning::strip_controls(&delta));
+                    turn.content.push_str(&clean);
                 }
                 let added = self.transcript_display_rows().saturating_sub(before);
                 self.viewport.appended(added);
             }
             ResponseEvent::Source { title, url } => {
                 let before = self.transcript_display_rows();
-                if let Some(turn) = self.turns.last_mut() {
-                    turn.content.push_str(&format!("\nSource: {title} - {url}"));
+                if let Some(turn) = self.turns.last_mut()
+                    && let Some(url) = safe_url(&url)
+                {
+                    turn.add_source(&title, &url);
                 }
                 let added = self.transcript_display_rows().saturating_sub(before);
                 self.viewport.appended(added);
@@ -327,16 +425,25 @@ impl App {
             ResponseEvent::Completed => {
                 self.active = None;
                 self.status = "Complete".into();
+                if let Err(error) = self.persist_session() {
+                    self.status = format!("Session save failed: {error}");
+                }
             }
             ResponseEvent::Cancelled => {
                 self.remove_empty_active_turn();
                 self.active = None;
                 self.status = "Cancelled".into();
+                if let Err(error) = self.persist_session() {
+                    self.status = format!("Session save failed: {error}");
+                }
             }
             ResponseEvent::Failed { message } => {
                 self.remove_empty_active_turn();
                 self.active = None;
                 self.status = message;
+                if let Err(error) = self.persist_session() {
+                    self.status = format!("Session save failed: {error}");
+                }
             }
         }
     }
@@ -352,6 +459,15 @@ impl App {
     }
 
     fn submit(&mut self) {
+        if self.active.is_some() {
+            self.status = "Generation already active; draft kept".into();
+            return;
+        }
+        if is_sessions_command(&self.input) {
+            self.input.clear();
+            self.open_sessions();
+            return;
+        }
         if self.turns.is_empty() {
             self.target = std::mem::take(&mut self.input);
             self.start(LearningAction::Initial, None);
@@ -369,13 +485,17 @@ impl App {
     }
 
     fn action_with_input(&mut self, action: LearningAction) {
+        if self.active.is_some() {
+            self.status = "Generation already active; draft kept".into();
+            return;
+        }
         let detail = (!self.input.trim().is_empty()).then(|| std::mem::take(&mut self.input));
         self.start(action, detail);
     }
 
     fn cancel(&mut self) {
-        if let Some((_, token)) = &self.active {
-            token.cancel();
+        if let Some(active) = &self.active {
+            active.cancellation.cancel();
             self.status = "Cancelling response...".into();
         }
     }
@@ -465,11 +585,15 @@ impl App {
                 self.popup = None;
                 self.new_problem();
             }
+            Command::Sessions => self.open_sessions(),
             Command::Help => {
                 self.popup = None;
                 self.screen = Screen::Help;
             }
-            Command::Quit => self.quit_requested = true,
+            Command::Quit => {
+                self.popup = None;
+                self.request_quit();
+            }
         }
     }
 
@@ -678,9 +802,14 @@ impl App {
             .map_or(&self.settings, |draft| &draft.values)
     }
 
+    #[cfg(test)]
     fn handle_event(&mut self, event: Event) -> bool {
+        self.handle_event_at(event, Instant::now())
+    }
+
+    fn handle_event_at(&mut self, event: Event, now: Instant) -> bool {
         match event {
-            Event::Key(key) => self.handle_key(key),
+            Event::Key(key) => self.handle_key_at(key, now),
             Event::Mouse(mouse) => {
                 self.handle_mouse(mouse);
                 false
@@ -693,8 +822,19 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> bool {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        if self.screen == Screen::Main
+            && self.popup.is_none()
+            && self.handle_pending_enter_key(key, now)
+        {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -703,7 +843,10 @@ impl App {
                     self.open_palette();
                     return false;
                 }
-                KeyCode::Char('q') => return true,
+                KeyCode::Char('q') => {
+                    self.request_quit();
+                    return self.quit_requested;
+                }
                 KeyCode::Char('c') if self.selection.is_some() => {
                     self.copy_selection();
                     return false;
@@ -731,6 +874,44 @@ impl App {
         false
     }
 
+    fn handle_pending_enter_key(&mut self, key: KeyEvent, now: Instant) -> bool {
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.pending_enter = None;
+            self.unframed_paste = false;
+            self.submit();
+            return true;
+        }
+        match key.code {
+            KeyCode::Char(character)
+                if self.pending_enter.is_some()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                self.pending_enter = None;
+                self.unframed_paste = true;
+                self.input.push('\n');
+                self.input.push(character);
+                true
+            }
+            KeyCode::Enter if self.pending_enter.is_some() && key.modifiers.is_empty() => {
+                self.pending_enter = None;
+                self.unframed_paste = true;
+                self.input.push_str("\n\n");
+                true
+            }
+            _ if self.pending_enter.is_some() => {
+                self.flush_pending_enter();
+                false
+            }
+            KeyCode::Enter if key.modifiers.is_empty() && !self.unframed_paste => {
+                self.pending_enter = Some(now + ENTER_DELAY);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_main_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Left | KeyCode::Right)
@@ -743,7 +924,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('?') => self.screen = Screen::Help,
+            KeyCode::Tab => self.toggle_mode(),
             KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.refresh_models()
             }
@@ -762,7 +943,8 @@ impl App {
                 self.viewport
                     .clamp(self.transcript_lines, self.body_height());
             }
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter if self.unframed_paste => self.input.push('\n'),
+            KeyCode::Enter => {}
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -779,13 +961,7 @@ impl App {
     fn handle_main_function_key(&mut self, number: u8) {
         match number {
             1 => self.screen = Screen::Help,
-            2 if self.turns.is_empty() => {
-                self.mode = if self.mode == LearningMode::Socratic {
-                    LearningMode::WorkedExample
-                } else {
-                    LearningMode::Socratic
-                }
-            }
+            2 => self.toggle_mode(),
             3 => self.toggle_search(),
             4 => self.open_palette(),
             5 if self.mode == LearningMode::Socratic && !self.turns.is_empty() => {
@@ -805,6 +981,26 @@ impl App {
         }
     }
 
+    fn toggle_mode(&mut self) {
+        if !self.turns.is_empty() {
+            self.status = "Mode is locked for this session; Ctrl+N starts a new one".into();
+            return;
+        }
+        self.mode = if self.mode == LearningMode::Socratic {
+            LearningMode::WorkedExample
+        } else {
+            LearningMode::Socratic
+        };
+        self.status = format!(
+            "Mode: {}",
+            if self.mode == LearningMode::Socratic {
+                "Socratic"
+            } else {
+                "Worked Example"
+            }
+        );
+    }
+
     fn handle_service_function_key(&mut self, number: u8) {
         match number {
             6 => self.login(),
@@ -815,7 +1011,9 @@ impl App {
     }
 
     fn handle_popup_key(&mut self, key: KeyEvent) {
-        if matches!(self.popup, Some(Popup::Palette { .. })) {
+        if matches!(self.popup, Some(Popup::Sessions { .. })) {
+            self.handle_sessions_key(key);
+        } else if matches!(self.popup, Some(Popup::Palette { .. })) {
             self.handle_palette_key(key);
         } else if matches!(self.popup, Some(Popup::Setting { .. })) {
             self.handle_setting_key(key);
@@ -831,7 +1029,7 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.popup = None,
-            KeyCode::Enter => {
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(command) = self.selected_palette_command() {
                     self.execute_command(command);
                 }
@@ -867,7 +1065,9 @@ impl App {
     fn handle_setting_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.open_palette(),
-            KeyCode::Enter => self.confirm_setting(),
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.confirm_setting()
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
             KeyCode::Backspace => self.edit_popup_setting(None),
@@ -898,10 +1098,13 @@ impl App {
             KeyCode::Esc => self.popup = None,
             KeyCode::Up | KeyCode::Char('k') => self.move_popup(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_popup(1),
-            KeyCode::Enter if matches!(self.popup, Some(Popup::Effort { .. })) => {
+            KeyCode::Enter
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(self.popup, Some(Popup::Effort { .. })) =>
+            {
                 self.confirm_effort()
             }
-            KeyCode::Enter => self.select_model(),
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => self.select_model(),
             KeyCode::Char('r') if matches!(self.popup, Some(Popup::Models { .. })) => {
                 self.refresh_models()
             }
@@ -921,6 +1124,12 @@ impl App {
             Some(Popup::Effort { state, model }) => {
                 move_list(state, model.reasoning_efforts.len() + 1, delta)
             }
+            Some(Popup::Sessions {
+                query,
+                state,
+                sessions,
+                ..
+            }) => move_list(state, filtered_sessions(sessions, query).len(), delta),
             _ => {}
         }
     }
@@ -1069,15 +1278,42 @@ impl App {
             MouseEventKind::Down(MouseButton::Left)
                 if self.body_area.contains((mouse.column, mouse.row).into()) =>
             {
+                self.mouse_down = Some((mouse.column, mouse.row));
+                self.mouse_dragged = false;
                 let index = self.mouse_text_index(mouse.column, mouse.row);
                 self.selection_anchor = index;
                 self.selection = Some((index, index));
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_dragged = true;
                 let index = self.mouse_text_index(mouse.column, mouse.row);
                 self.selection = Some((self.selection_anchor, index));
             }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let click = self.mouse_down.take() == Some((mouse.column, mouse.row));
+                if click && !self.mouse_dragged {
+                    self.open_link_at_with(mouse.column, mouse.row, |url| open::that_detached(url));
+                }
+                self.mouse_dragged = false;
+            }
             _ => {}
+        }
+    }
+
+    fn open_link_at_with<E: std::fmt::Display>(
+        &mut self,
+        column: u16,
+        row: u16,
+        open: impl FnOnce(&str) -> Result<(), E>,
+    ) {
+        let Some(hitbox) = self.link_hitboxes.iter().find(|hitbox| {
+            hitbox.row == row && (hitbox.start_column..hitbox.end_column).contains(&column)
+        }) else {
+            return;
+        };
+        match open(&hitbox.url) {
+            Ok(()) => self.status = "Opened link".into(),
+            Err(_) => self.status = "Could not open link".into(),
         }
     }
 
@@ -1118,17 +1354,25 @@ impl App {
                 state.select(Some(state.offset() + item_row));
                 self.confirm_effort();
             }
+            Some(Popup::Sessions {
+                query,
+                state,
+                sessions,
+                ..
+            }) if state.offset() + item_row / 2 < filtered_sessions(sessions, query).len() => {
+                state.select(Some(state.offset() + item_row / 2));
+                self.restore_selected_session();
+            }
             _ => {}
         }
     }
 
     fn mouse_text_index(&self, column: u16, row: u16) -> usize {
-        // Mouse cells are an approximation for wide glyphs, but indexes always target rendered text.
         let width = usize::from(self.body_area.width.saturating_sub(2)).max(1);
-        let line = self.viewport.offset + usize::from(row.saturating_sub(self.body_area.y + 1));
-        line.saturating_mul(width)
-            .saturating_add(usize::from(column.saturating_sub(self.body_area.x + 1)))
-            .min(self.transcript_rendered_plain().chars().count())
+        let source_row = self.viewport.offset
+            + usize::from(row.saturating_sub(self.body_area.y.saturating_add(1)));
+        let source_column = usize::from(column.saturating_sub(self.body_area.x.saturating_add(1)));
+        text_layout(&self.transcript_rendered_plain(), width).index_at(source_row, source_column)
     }
 
     fn scroll(&mut self, delta: isize) {
@@ -1151,6 +1395,15 @@ impl App {
     }
 
     fn new_problem(&mut self) {
+        self.new_problem_with(sessions::upsert);
+    }
+
+    fn new_problem_with(&mut self, save: impl FnOnce(sessions::Session) -> Result<(), String>) {
+        self.flush_pending_enter();
+        if let Err(error) = self.persist_session_with(save) {
+            self.status = format!("Session save failed; new session cancelled: {error}");
+            return;
+        }
         self.cancel();
         self.generation += 1;
         self.active = None;
@@ -1159,7 +1412,142 @@ impl App {
         self.turns.clear();
         self.viewport = Viewport::new();
         self.selection = None;
+        self.session_id = uuid::Uuid::new_v4().to_string();
+        self.session_created_at = sessions::now();
+        self.unframed_paste = false;
         self.status = "New problem".into();
+    }
+
+    fn flush_pending_enter(&mut self) {
+        if self.pending_enter.take().is_some() {
+            self.unframed_paste = false;
+            self.submit();
+        }
+    }
+
+    fn flush_pending_enter_if_due(&mut self, now: Instant) {
+        if self.pending_enter.is_some_and(|deadline| now >= deadline) {
+            self.flush_pending_enter();
+        }
+    }
+
+    fn persist_session(&mut self) -> Result<(), String> {
+        self.persist_session_with(sessions::upsert)
+    }
+
+    fn persist_session_with(
+        &mut self,
+        save: impl FnOnce(sessions::Session) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.persist_sessions {
+            return Ok(());
+        }
+        let Some(session) = sessions::from_app(
+            &self.session_id,
+            self.session_created_at,
+            &self.target,
+            self.mode,
+            self.web_search,
+            &self.turns,
+        ) else {
+            return Ok(());
+        };
+        save(session)
+    }
+
+    fn open_sessions(&mut self) {
+        self.flush_pending_enter();
+        let (items, error) = match sessions::load() {
+            Ok(items) => (items, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let mut state = ListState::default();
+        state.select((!items.is_empty()).then_some(0));
+        self.popup = Some(Popup::Sessions {
+            query: String::new(),
+            state,
+            sessions: items,
+            error,
+        });
+    }
+
+    fn handle_sessions_key(&mut self, key: KeyEvent) {
+        if let Some(delta) = palette_navigation(key) {
+            self.move_popup(delta);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.restore_selected_session()
+            }
+            KeyCode::Backspace => self.edit_sessions_query(None),
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.edit_sessions_query(Some(character));
+            }
+            _ => {}
+        }
+    }
+
+    fn edit_sessions_query(&mut self, character: Option<char>) {
+        if let Some(Popup::Sessions {
+            query,
+            state,
+            sessions,
+            ..
+        }) = &mut self.popup
+        {
+            if let Some(character) = character {
+                query.push(character);
+            } else {
+                query.pop();
+            }
+            state.select((!filtered_sessions(sessions, query).is_empty()).then_some(0));
+        }
+    }
+
+    fn restore_selected_session(&mut self) {
+        self.restore_selected_session_with(sessions::upsert);
+    }
+
+    fn restore_selected_session_with(
+        &mut self,
+        save: impl FnOnce(sessions::Session) -> Result<(), String>,
+    ) {
+        let selected = match &self.popup {
+            Some(Popup::Sessions {
+                query,
+                state,
+                sessions,
+                ..
+            }) => state
+                .selected()
+                .and_then(|index| filtered_sessions(sessions, query).into_iter().nth(index))
+                .cloned(),
+            _ => None,
+        };
+        let Some(session) = selected else { return };
+        if let Err(error) = self.persist_session_with(save) {
+            self.status = format!("Session save failed; restore cancelled: {error}");
+            return;
+        }
+        self.cancel();
+        self.generation += 1;
+        self.active = None;
+        self.session_id = session.id.clone();
+        self.session_created_at = session.created_at;
+        self.target = session.problem.clone();
+        self.mode = session.mode;
+        self.web_search = session.web_search;
+        self.reconcile_web_search();
+        self.turns = sessions::into_turns(&session);
+        self.input.clear();
+        self.pending_enter = None;
+        self.unframed_paste = false;
+        self.selection = None;
+        self.viewport = Viewport::new();
+        self.popup = None;
+        self.status = "Session restored; continuation uses the current provider and model".into();
     }
 
     fn login(&mut self) {
@@ -1189,51 +1577,101 @@ impl App {
         }
     }
 
-    fn transcript_source(&self) -> String {
-        let mut text = String::new();
+    fn transcript_rendered_result(&self) -> RenderedTranscript {
+        let colors = palette(self.current_settings().theme);
+        let mut result = RenderedTranscript {
+            text: Text::default(),
+            plain: String::new(),
+            links: Vec::new(),
+        };
+        if self.target.is_empty() && self.turns.is_empty() {
+            append_owned_line(
+                &mut result,
+                "Type a problem below. Choose the mode with Tab or F2 before starting.",
+                Style::new().fg(colors.muted),
+            );
+            return result;
+        }
         if !self.target.is_empty() {
-            text.push_str(&format!(
-                "Problem\n{}\n\n",
-                learning::strip_controls(&self.target)
-            ));
+            append_section_header(&mut result, "Problem", colors.accent, colors);
+            append_owned_line(
+                &mut result,
+                &learning::strip_controls(&self.target),
+                Style::new().fg(colors.text),
+            );
+            append_blank_line(&mut result);
         }
         for (index, turn) in self.turns.iter().enumerate() {
             if let Some(detail) = &turn.detail {
-                text.push_str(&format!("You\n{}\n\n", learning::strip_controls(detail)));
+                append_section_header(&mut result, "You", colors.green, colors);
+                append_owned_line(
+                    &mut result,
+                    &learning::strip_controls(detail),
+                    Style::new().fg(colors.text),
+                );
+                append_blank_line(&mut result);
             }
             let visible = learning::visible_content(&turn.content);
-            if self.active.is_some() && index + 1 == self.turns.len() && visible.trim().is_empty() {
+            let pending = self.active.is_some() && index + 1 == self.turns.len();
+            if pending && !self.active.as_ref().unwrap().visible_text_started {
+                append_pending(
+                    &mut result,
+                    self.active.as_ref().unwrap(),
+                    self.mode,
+                    colors,
+                );
                 continue;
             }
-            text.push_str(&format!("{}\n{}\n\n", turn.label, visible));
+            append_section_header(
+                &mut result,
+                &format!("Guide / {}", turn.label),
+                colors.yellow,
+                colors,
+            );
+            append_markdown(&mut result, &visible, colors);
+            if !turn.sources.is_empty() {
+                append_owned_line(
+                    &mut result,
+                    "Sources",
+                    Style::new().fg(colors.accent).add_modifier(Modifier::BOLD),
+                );
+                for source in &turn.sources {
+                    let start = result.plain.chars().count();
+                    let prefix_chars = 4 + source.title.chars().count();
+                    append_owned_line(
+                        &mut result,
+                        &format!("  {}  {}", source.title, source.url),
+                        Style::new()
+                            .fg(colors.accent)
+                            .add_modifier(Modifier::UNDERLINED),
+                    );
+                    let url_chars = source.url.chars().count();
+                    result.links.push(TranscriptLink {
+                        range: start + prefix_chars..start + prefix_chars + url_chars,
+                        url: source.url.clone(),
+                    });
+                }
+            }
+            append_blank_line(&mut result);
         }
-        if text.is_empty() {
-            "Type a problem below. Choose the mode before starting with F2.".into()
-        } else {
-            text
-        }
+        result
+    }
+
+    #[cfg(test)]
+    fn transcript_source(&self) -> String {
+        self.transcript_rendered_plain()
     }
 
     fn transcript_rendered(&self) -> Text<'static> {
-        markdown_text(
-            &self.transcript_source(),
-            palette(self.current_settings().theme),
-        )
+        self.transcript_rendered_result().text
     }
 
     fn transcript_rendered_plain(&self) -> String {
-        text_plain(&markdown_text(
-            &self.transcript_source(),
-            palette(self.current_settings().theme),
-        ))
+        self.transcript_rendered_result().plain
     }
 
     fn transcript_display_rows(&self) -> usize {
         rendered_rows(self.transcript_rendered(), self.body_area.width)
-    }
-
-    fn persist_on_quit(&self) -> Result<(), String> {
-        self.persist_on_quit_with(settings::save)
     }
 
     fn persist_on_quit_with(
@@ -1241,6 +1679,31 @@ impl App {
         save: impl FnOnce(&Settings) -> Result<(), String>,
     ) -> Result<(), String> {
         save(&self.settings)
+    }
+
+    fn request_quit(&mut self) {
+        self.request_quit_with(sessions::upsert, settings::save);
+    }
+
+    fn request_quit_with(
+        &mut self,
+        save_session: impl FnOnce(sessions::Session) -> Result<(), String>,
+        save_settings: impl FnOnce(&Settings) -> Result<(), String>,
+    ) {
+        if self.force_quit_armed {
+            self.quit_requested = true;
+            return;
+        }
+        let result = self
+            .persist_session_with(save_session)
+            .and_then(|()| self.persist_on_quit_with(save_settings));
+        match result {
+            Ok(()) => self.quit_requested = true,
+            Err(error) => {
+                self.status = format!("Save failed; Ctrl+Q again forces quit: {error}");
+                self.force_quit_armed = true;
+            }
+        }
     }
 }
 
@@ -1251,6 +1714,46 @@ fn move_list(state: &mut ListState, length: usize, delta: isize) {
     }
     let current = state.selected().unwrap_or(0);
     state.select(Some(current.saturating_add_signed(delta).min(length - 1)));
+}
+
+fn filtered_sessions<'a>(
+    sessions: &'a [sessions::Session],
+    query: &str,
+) -> Vec<&'a sessions::Session> {
+    let query = query.to_ascii_lowercase();
+    sessions
+        .iter()
+        .filter(|session| {
+            sessions::title(session)
+                .to_ascii_lowercase()
+                .contains(&query)
+        })
+        .collect()
+}
+
+fn is_sessions_command(input: &str) -> bool {
+    input.trim() == "/sessions"
+}
+
+fn format_timestamp(timestamp: u64) -> String {
+    let days = timestamp / 86_400;
+    let seconds = timestamp % 86_400;
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        seconds / 3_600,
+        seconds / 60 % 60
+    )
 }
 
 fn palette_navigation(key: KeyEvent) -> Option<isize> {
@@ -1560,6 +2063,145 @@ fn markdown_text(value: &str, colors: Palette) -> Text<'static> {
     Text::from(renderer.render(&blocks, &MarkdownTheme(colors)))
 }
 
+fn append_line(result: &mut RenderedTranscript, line: Line<'static>) {
+    if !result.text.lines.is_empty() {
+        result.plain.push('\n');
+    }
+    for span in &line.spans {
+        result.plain.push_str(span.content.as_ref());
+    }
+    result.text.lines.push(line);
+}
+
+fn append_owned_line(result: &mut RenderedTranscript, value: &str, style: Style) {
+    let mut lines = value.split('\n');
+    if let Some(first) = lines.next() {
+        append_line(result, Line::styled(first.to_owned(), style));
+    }
+    for line in lines {
+        append_line(result, Line::styled(line.to_owned(), style));
+    }
+}
+
+fn append_blank_line(result: &mut RenderedTranscript) {
+    append_line(result, Line::default());
+}
+
+fn append_section_header(
+    result: &mut RenderedTranscript,
+    label: &str,
+    color: Color,
+    colors: Palette,
+) {
+    append_line(
+        result,
+        Line::from(vec![Span::styled(
+            format!(" {label} "),
+            Style::new()
+                .fg(colors.base)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    );
+}
+
+fn pending_message(action: LearningAction, mode: LearningMode) -> &'static str {
+    match (action, mode) {
+        (LearningAction::Initial, LearningMode::Socratic) => "Asking the first question...",
+        (LearningAction::Initial, LearningMode::WorkedExample) => "Preparing the worked example...",
+        (LearningAction::SocraticResponse, _) => "Asking the next question...",
+        (LearningAction::FollowUp, _) => "Preparing the follow-up...",
+        (LearningAction::ExplainTerm, _) => "Explaining the term...",
+        (LearningAction::AnotherHint, _) => "Preparing a hint...",
+        (LearningAction::ExplainStep, _) => "Explaining the step...",
+        (LearningAction::CheckAttempt, _) => "Checking the attempt...",
+        (LearningAction::RevealSolution, _) => "Preparing the solution...",
+    }
+}
+
+fn append_pending(
+    result: &mut RenderedTranscript,
+    active: &ActiveGeneration,
+    mode: LearningMode,
+    colors: Palette,
+) {
+    append_owned_line(
+        result,
+        &format!("  {}", pending_message(active.action, mode)),
+        Style::new()
+            .fg(colors.yellow)
+            .add_modifier(Modifier::ITALIC),
+    );
+    append_blank_line(result);
+}
+
+fn append_markdown(result: &mut RenderedTranscript, value: &str, colors: Palette) {
+    let text = markdown_text(value, colors);
+    let plain = text_plain(&text);
+    let base = result.plain.chars().count() + usize::from(!result.text.lines.is_empty());
+    let mut search_from = 0;
+    for (label, url) in markdown_links(value) {
+        if let Some(relative_start) = plain[search_from..].find(&label) {
+            let byte_start = search_from + relative_start;
+            let start = plain[..byte_start].chars().count();
+            result.links.push(TranscriptLink {
+                range: base + start..base + start + label.chars().count(),
+                url,
+            });
+            search_from = byte_start + label.len();
+        }
+    }
+    for line in text.lines {
+        append_line(result, line);
+    }
+}
+
+fn markdown_links(value: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for event in Parser::new(value) {
+        match event {
+            MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                current = safe_url(dest_url.as_ref()).map(|url| (String::new(), url));
+            }
+            MarkdownEvent::Text(text) | MarkdownEvent::Code(text) => {
+                if let Some((label, _)) = &mut current {
+                    label.push_str(&text);
+                }
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
+                if let Some((label, _)) = &mut current {
+                    label.push(' ');
+                }
+            }
+            MarkdownEvent::End(TagEnd::Link) => {
+                if let Some((label, url)) = current.take()
+                    && !label.is_empty()
+                {
+                    links.push((label, url));
+                }
+            }
+            _ => {}
+        }
+    }
+    links
+}
+
+fn safe_url(value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host().is_none()
+    {
+        return None;
+    }
+    Some(parsed.into())
+}
+
 fn text_plain(text: &Text<'_>) -> String {
     text.lines
         .iter()
@@ -1578,6 +2220,208 @@ fn rendered_rows(text: Text<'static>, width: u16) -> usize {
         .block(Block::bordered())
         .wrap(Wrap { trim: false })
         .line_count(width)
+}
+
+fn fit_popup_line(value: &str, width: usize) -> String {
+    let value = learning::strip_controls(value);
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if unicode_width::UnicodeWidthStr::width(value.as_str()) <= width {
+        return value;
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut result = String::new();
+    let available = width - 3;
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > available {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push_str("...");
+    result
+}
+
+fn link_hitboxes(
+    rendered: &RenderedTranscript,
+    body: Rect,
+    viewport_offset: usize,
+) -> Vec<LinkHitbox> {
+    let width = usize::from(body.width.saturating_sub(2)).max(1);
+    let height = usize::from(body.height.saturating_sub(2));
+    let layout = text_layout(&rendered.plain, width);
+    let mut hitboxes: Vec<LinkHitbox> = Vec::new();
+    for link in &rendered.links {
+        for index in link.range.clone() {
+            let Some((source_row, source_column, cell_width)) = layout.position(index) else {
+                continue;
+            };
+            if source_row < viewport_offset || source_row >= viewport_offset + height {
+                continue;
+            }
+            let screen_row = body.y + 1 + (source_row - viewport_offset) as u16;
+            let start_column = body.x + 1 + source_column as u16;
+            let end_column = start_column + cell_width as u16;
+            if let Some(last) = hitboxes.last_mut()
+                && last.url == link.url
+                && last.row == screen_row
+                && last.end_column == start_column
+            {
+                last.end_column = end_column;
+            } else {
+                hitboxes.push(LinkHitbox {
+                    row: screen_row,
+                    start_column,
+                    end_column,
+                    url: link.url.clone(),
+                });
+            }
+        }
+    }
+    hitboxes
+}
+
+impl TextLayout {
+    fn position(&self, index: usize) -> Option<(usize, usize, usize)> {
+        self.rows.iter().enumerate().find_map(|(row, wrapped)| {
+            let mut column = 0;
+            for cell in &wrapped.cells {
+                if cell.index == index {
+                    return Some((row, column, cell.width));
+                }
+                column += cell.width;
+            }
+            None
+        })
+    }
+
+    fn index_at(&self, row: usize, column: usize) -> usize {
+        let Some(wrapped) = self.rows.get(row) else {
+            return self.text_len;
+        };
+        let mut cell_column = 0;
+        for cell in &wrapped.cells {
+            if column < cell_column + cell.width {
+                return cell.index;
+            }
+            cell_column += cell.width;
+        }
+        if column == 0 {
+            wrapped.start
+        } else {
+            wrapped.end
+        }
+    }
+}
+
+fn text_layout(value: &str, width: usize) -> TextLayout {
+    let text_len = value.chars().count();
+    let mut rows = Vec::new();
+    let mut line = Vec::new();
+    let mut line_start = 0;
+
+    for (index, character) in value.chars().enumerate() {
+        if character == '\n' {
+            append_wrapped_line(&mut rows, &line, line_start, index, width);
+            line.clear();
+            line_start = index + 1;
+        } else {
+            line.push(LayoutUnit {
+                index,
+                width: character.width().unwrap_or(0),
+                whitespace: character.is_whitespace(),
+            });
+        }
+    }
+    append_wrapped_line(&mut rows, &line, line_start, text_len, width);
+    TextLayout { rows, text_len }
+}
+
+// Mirrors Ratatui 0.30's WordWrapper state machine for Wrap { trim: false }.
+fn append_wrapped_line(
+    rows: &mut Vec<WrappedRow>,
+    units: &[LayoutUnit],
+    line_start: usize,
+    line_end: usize,
+    width: usize,
+) {
+    let mut wrapped = Vec::new();
+    let mut pending_line: Vec<LayoutUnit> = Vec::new();
+    let mut pending_word: Vec<LayoutUnit> = Vec::new();
+    let mut pending_whitespace: VecDeque<LayoutUnit> = VecDeque::new();
+    let mut line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace_width = 0usize;
+    let mut non_whitespace_previous = false;
+
+    for unit in units.iter().copied() {
+        if unit.width > width {
+            continue;
+        }
+        let word_found = non_whitespace_previous && unit.whitespace;
+        let untrimmed_overflow =
+            pending_line.is_empty() && word_width + whitespace_width + unit.width > width;
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_whitespace.drain(..));
+            line_width += whitespace_width;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= width;
+        let pending_word_overflow =
+            unit.width > 0 && line_width + whitespace_width + word_width >= width;
+        if line_full || pending_word_overflow {
+            let mut remaining_width = width.saturating_sub(line_width);
+            wrapped.push(std::mem::take(&mut pending_line));
+            line_width = 0;
+            while let Some(space) = pending_whitespace.front() {
+                if space.width > remaining_width {
+                    break;
+                }
+                whitespace_width -= space.width;
+                remaining_width -= space.width;
+                pending_whitespace.pop_front();
+            }
+            if unit.whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if unit.whitespace {
+            whitespace_width += unit.width;
+            pending_whitespace.push_back(unit);
+        } else {
+            word_width += unit.width;
+            pending_word.push(unit);
+        }
+        non_whitespace_previous = !unit.whitespace;
+    }
+
+    pending_line.extend(pending_whitespace);
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() {
+        wrapped.push(pending_line);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Vec::new());
+    }
+
+    for index in 0..wrapped.len() {
+        let cells = std::mem::take(&mut wrapped[index]);
+        let start = cells.first().map_or(line_start, |cell| cell.index);
+        let end = wrapped[index + 1..]
+            .iter()
+            .find_map(|next| next.first().map(|cell| cell.index))
+            .unwrap_or(line_end);
+        rows.push(WrappedRow { cells, start, end });
+    }
 }
 
 fn highlight_selection(
@@ -1681,12 +2525,13 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
         ),
         header,
     );
-    let mut text = app.transcript_rendered();
+    let rendered = app.transcript_rendered_result();
+    let mut text = rendered.text.clone();
     highlight_selection(&mut text, app.selection, colors);
     app.transcript_lines = rendered_rows(text.clone(), body.width);
     app.viewport.clamp(app.transcript_lines, app.body_height());
     let title = if app.viewport.unseen > 0 {
-        format!(" Session / {} new lines ", app.viewport.unseen)
+        format!(" Session / {} new rows below ", app.viewport.unseen)
     } else {
         " Session ".into()
     };
@@ -1704,34 +2549,7 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
             .scroll((app.viewport.offset.min(u16::MAX as usize) as u16, 0)),
         body,
     );
-    if app.active.is_some()
-        && app
-            .turns
-            .last()
-            .is_some_and(|turn| learning::visible_content(&turn.content).trim().is_empty())
-    {
-        let area = centered(46, 28, body);
-        let spinner = ["|", "/", "-", "\\"][(app.tick as usize) % 4];
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(format!(
-                "\n{spinner}  Preparing {}...",
-                if app.mode == LearningMode::Socratic {
-                    "your first prompt"
-                } else {
-                    "worked example"
-                }
-            ))
-            .centered()
-            .style(Style::new().fg(colors.yellow).add_modifier(Modifier::BOLD))
-            .block(
-                Block::bordered()
-                    .title(" Loading ")
-                    .border_style(Style::new().fg(colors.accent)),
-            ),
-            area,
-        );
-    }
+    app.link_hitboxes = link_hitboxes(&rendered, body, app.viewport.offset);
     let mut scrollbar = ScrollbarState::new(app.transcript_lines)
         .position(app.viewport.offset)
         .viewport_content_length(app.body_height());
@@ -1744,9 +2562,9 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
         &mut scrollbar,
     );
     let input_title = if app.turns.is_empty() {
-        " Problem / Enter to start "
+        " Problem / Enter start / Ctrl+Enter multiline "
     } else {
-        " Response / Enter to send "
+        " Response / Enter send / Ctrl+Enter multiline "
     };
     frame.render_widget(
         Paragraph::new(app.input.as_str())
@@ -1778,7 +2596,7 @@ fn render_main(frame: &mut Frame, app: &mut App, colors: Palette) {
                 Span::raw(app.status.as_str()),
             ]),
             Line::styled(
-                "Ctrl+P commands  F1 help  PgUp/PgDn scroll  Ctrl+C/V copy/paste  Ctrl+Q quit",
+                "Ctrl+P commands  /sessions history  Ctrl+Enter multiline send  F1 help  Ctrl+Q quit",
                 Style::new().fg(colors.text),
             ),
         ])),
@@ -1837,7 +2655,7 @@ fn render_settings(frame: &mut Frame, app: &App, colors: Palette) {
 }
 
 fn render_help(frame: &mut Frame, colors: Palette) {
-    let help = "KEYBOARD\nCtrl+P or F4  Search commands and configuration\nPalette: type to filter; arrows, j/k, Ctrl+N/P, or Ctrl+J/K navigate; Enter confirms; Esc cancels\nEnter  Start/send or confirm dialog\nEsc  Cancel response or close dialog\nF2  Mode before session\nF3  Web search\nF5  Another hint\nF8 or Ctrl+M  Model and reasoning picker\nF9/F10/F12  Explain/check/reveal\nPgUp/PgDn or mouse wheel  Scroll\nCtrl+Home/End  Top/follow latest\nShift+Left/Right  Extend transcript selection\nCtrl+C/Ctrl+V  Copy selection/paste into text editors\nCtrl+N  New problem (outside palette)\nCtrl+Q  Quit\n\nMOUSE\nWheel scrolls. Drag selects transcript text. Click palette and dialog choices to activate them; click setting text editors to focus.\n\nPress any key to return.";
+    let help = "KEYBOARD\nCtrl+P or F4  Search commands and configuration\nPalette/pickers: type to filter; arrows, j/k, Ctrl+N/P, or Ctrl+J/K navigate; Enter confirms; Esc cancels\nEnter  Start/send after paste detection, add newline in unframed paste, or confirm dialog\nCtrl+Enter  Submit a multiline draft immediately\n/sessions  Browse and continue saved sessions (exact main-input command)\nEsc  Cancel response or close dialog\nTab or F2  Mode before session\nF3  Web search\nF5  Another hint\nF8 or Ctrl+M  Model and reasoning picker\nF9/F10/F12  Explain/check/reveal\nPgUp/PgDn or mouse wheel  Scroll\nCtrl+Home/End  Top/follow latest\nShift+Left/Right  Extend transcript selection\nCtrl+C/Ctrl+V  Copy selection/paste into text editors\nCtrl+N  Save and start a new problem (outside palette)\nCtrl+Q  Save and quit\n\nMOUSE\nWheel scrolls. Drag selects transcript text. Click an http/https link to open it. Click palette and dialog choices to activate them.\n\nPress any key to return.";
     frame.render_widget(
         Paragraph::new(help)
             .style(Style::new().fg(colors.text))
@@ -1904,12 +2722,13 @@ fn render_popup(frame: &mut Frame, app: &mut App, colors: Palette) {
                     area,
                 );
             } else {
+                let line_width = usize::from(area.width.saturating_sub(6));
                 let items = models
                     .iter()
                     .map(|model| {
                         ListItem::new(format!(
                             "{}{}\n  {} reasoning option(s)",
-                            model.name,
+                            fit_popup_line(&model.name, line_width),
                             if model.is_default { "  default" } else { "" },
                             model.reasoning_efforts.len()
                         ))
@@ -1950,6 +2769,54 @@ fn render_popup(frame: &mut Frame, app: &mut App, colors: Palette) {
                 )
                 .highlight_symbol("> ");
             frame.render_stateful_widget(list, area, state);
+        }
+        Some(Popup::Sessions {
+            query,
+            state,
+            sessions,
+            error,
+        }) => {
+            if let Some(error) = error {
+                frame.render_widget(
+                    Paragraph::new(format!("{error}\n\nEsc closes this dialog"))
+                        .style(Style::new().fg(colors.red))
+                        .block(Block::bordered().title(" Sessions / error ")),
+                    area,
+                );
+            } else {
+                let filtered = filtered_sessions(sessions, query);
+                if filtered.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new("No matching saved sessions.\n\nType to search / Esc close")
+                            .block(Block::bordered().title(format!(" Sessions > {query}_ "))),
+                        area,
+                    );
+                } else {
+                    let line_width = usize::from(area.width.saturating_sub(6));
+                    let items = filtered.iter().map(|session| {
+                        ListItem::new(format!(
+                            "{}\n  updated {}  {:?}",
+                            fit_popup_line(&sessions::title(session), line_width),
+                            format_timestamp(session.updated_at),
+                            session.mode
+                        ))
+                    });
+                    let list = List::new(items)
+                        .block(
+                            Block::bordered()
+                                .title(format!(" Sessions > {query}_ / Enter continue / Esc "))
+                                .border_style(Style::new().fg(colors.accent)),
+                        )
+                        .highlight_style(
+                            Style::new()
+                                .fg(colors.base)
+                                .bg(colors.accent)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("> ");
+                    frame.render_stateful_widget(list, area, state);
+                }
+            }
         }
         None => {}
     }
@@ -2069,10 +2936,8 @@ async fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
     loop {
         if run_frame(terminal, &mut app)? {
+            app.flush_pending_enter();
             app.cancel();
-            if let Err(error) = app.persist_on_quit() {
-                app.status = error;
-            }
             break;
         }
     }
@@ -2082,11 +2947,50 @@ async fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
 fn run_frame(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<bool> {
     app.tick = app.tick.wrapping_add(1);
     drain_events(app);
+    app.flush_pending_enter_if_due(Instant::now());
     terminal.draw(|frame| render(frame, app))?;
-    if !event::poll(Duration::from_millis(50))? {
+    let Some((batch_time, first_event)) = wait_for_terminal_event(terminal_timeout(app))? else {
+        app.flush_pending_enter_if_due(Instant::now());
         return Ok(false);
+    };
+    let events = read_queued_terminal_events(first_event)?;
+    Ok(process_terminal_batch(app, events, batch_time))
+}
+
+fn terminal_timeout(app: &App) -> Duration {
+    app.pending_enter
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_millis(50))
+        .min(Duration::from_millis(50))
+}
+
+fn wait_for_terminal_event(timeout: Duration) -> io::Result<Option<(Instant, Event)>> {
+    if !event::poll(timeout)? {
+        return Ok(None);
     }
-    Ok(app.handle_event(event::read()?))
+    let batch_time = Instant::now();
+    Ok(Some((batch_time, event::read()?)))
+}
+
+fn read_queued_terminal_events(first_event: Event) -> io::Result<Vec<Event>> {
+    let mut events = vec![first_event];
+    while events.len() < MAX_TERMINAL_BATCH && event::poll(Duration::ZERO)? {
+        events.push(event::read()?);
+    }
+    Ok(events)
+}
+
+fn process_terminal_batch(
+    app: &mut App,
+    events: impl IntoIterator<Item = Event>,
+    batch_time: Instant,
+) -> bool {
+    let mut quit = false;
+    for event in events.into_iter().take(MAX_TERMINAL_BATCH) {
+        quit |= app.handle_event_at(event, batch_time);
+    }
+    app.flush_pending_enter_if_due(batch_time);
+    quit
 }
 
 #[tokio::main]
@@ -2171,7 +3075,25 @@ mod tests {
             transcript_lines: 100,
             selection: None,
             selection_anchor: 0,
+            mouse_down: None,
+            mouse_dragged: false,
+            link_hitboxes: Vec::new(),
             quit_requested: false,
+            force_quit_armed: false,
+            session_id: "test-session".into(),
+            session_created_at: 1,
+            pending_enter: None,
+            unframed_paste: false,
+            persist_sessions: false,
+        }
+    }
+
+    fn active(id: u64, action: LearningAction) -> ActiveGeneration {
+        ActiveGeneration {
+            id,
+            cancellation: CancellationToken::new(),
+            action,
+            visible_text_started: false,
         }
     }
 
@@ -2362,8 +3284,9 @@ mod tests {
             label: "Guide".into(),
             content: "x".into(),
             detail: None,
+            sources: Vec::new(),
         });
-        app.active = Some((1, CancellationToken::new()));
+        app.active = Some(active(1, LearningAction::AnotherHint));
         app.viewport.follow_tail = false;
 
         app.handle_response(1, ResponseEvent::TextDelta { delta: "y".into() });
@@ -2428,6 +3351,7 @@ mod tests {
             label: "Guide".into(),
             content: "# Heading\n- café 🦀\n```rust\nlet λ = 1;\n```".into(),
             detail: None,
+            sources: Vec::new(),
         });
         let plain = app.transcript_rendered_plain();
         assert!(plain.contains("Heading"));
@@ -2470,6 +3394,344 @@ mod tests {
                 .model
                 .ends_with("xy")
         );
+    }
+
+    #[test]
+    fn unframed_multiline_paste_is_coalesced_into_one_draft() {
+        let mut app = test_app();
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Char('b'),
+            KeyCode::Enter,
+        ] {
+            app.handle_key(key(code));
+        }
+        assert_eq!(app.input, "a\nb\n");
+        assert!(app.turns.is_empty());
+        assert!(app.active.is_none());
+    }
+
+    #[test]
+    fn shifted_printable_keys_continue_an_unframed_paste() {
+        let mut app = test_app();
+        app.input = "before".into();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(modified_key(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(modified_key(KeyCode::Char('!'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.input, "before\nA\n!");
+        assert!(app.unframed_paste);
+        assert!(app.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_modifiers_do_not_continue_an_unframed_paste() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            let mut app = test_app();
+            app.input = "problem".into();
+            app.handle_key(key(KeyCode::Enter));
+            app.handle_key(modified_key(KeyCode::Char('X'), modifiers));
+
+            assert_eq!(app.target, "problem");
+            assert!(app.active.is_some());
+            assert!(!app.unframed_paste);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_enter_submits_once_after_deadline() {
+        let mut app = test_app();
+        app.input = "problem".into();
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.turns.is_empty());
+        app.flush_pending_enter_if_due(Instant::now() + ENTER_DELAY);
+        assert_eq!(app.turns.len(), 1);
+        assert_eq!(app.target, "problem");
+        assert!(app.active.is_some());
+    }
+
+    #[tokio::test]
+    async fn queued_terminal_burst_uses_one_arrival_time_across_render_delay() {
+        let mut app = test_app();
+        let arrival = Instant::now();
+        let events = [
+            Event::Key(key(KeyCode::Char('a'))),
+            Event::Key(key(KeyCode::Enter)),
+            Event::Key(key(KeyCode::Char('b'))),
+            Event::Key(key(KeyCode::Enter)),
+            Event::Key(key(KeyCode::Char('c'))),
+        ];
+
+        assert!(!process_terminal_batch(&mut app, events, arrival));
+        app.flush_pending_enter_if_due(arrival + ENTER_DELAY + Duration::from_secs(1));
+
+        assert_eq!(app.input, "a\nb\nc");
+        assert!(app.turns.is_empty());
+        assert!(app.active.is_none());
+    }
+
+    #[test]
+    fn terminal_batch_processes_at_most_the_queue_limit() {
+        let mut app = test_app();
+        let events = (0..MAX_TERMINAL_BATCH + 10).map(|_| Event::Key(key(KeyCode::Char('x'))));
+
+        assert!(!process_terminal_batch(&mut app, events, Instant::now()));
+
+        assert_eq!(app.input.len(), MAX_TERMINAL_BATCH);
+    }
+
+    #[tokio::test]
+    async fn control_enter_explicitly_submits_multiline_draft() {
+        let mut app = test_app();
+        app.input = "line one\nline two\n".into();
+        app.unframed_paste = true;
+        app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.target, "line one\nline two\n");
+        assert_eq!(app.turns.len(), 1);
+        assert!(!app.unframed_paste);
+    }
+
+    #[test]
+    fn submit_during_generation_keeps_draft_for_enter_and_control_enter() {
+        for control in [false, true] {
+            let mut app = test_app();
+            app.target = "problem".into();
+            app.input = "draft answer".into();
+            app.turns.push(Turn {
+                label: "First question".into(),
+                content: "Question".into(),
+                detail: None,
+                sources: Vec::new(),
+            });
+            app.active = Some(active(1, LearningAction::Initial));
+            let modifiers = if control {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            app.handle_key_at(modified_key(KeyCode::Enter, modifiers), Instant::now());
+            app.flush_pending_enter_if_due(Instant::now() + ENTER_DELAY);
+            assert_eq!(app.input, "draft answer");
+            assert_eq!(app.turns.len(), 1);
+        }
+    }
+
+    #[test]
+    fn sessions_command_requires_an_exact_trimmed_match() {
+        assert!(is_sessions_command("  /sessions\n"));
+        assert!(!is_sessions_command("/sessions old"));
+        assert!(!is_sessions_command("/sessions-more"));
+    }
+
+    #[test]
+    fn restoring_a_session_resets_transient_state_and_keeps_current_settings() {
+        let mut app = test_app();
+        app.settings.model = "current-model".into();
+        app.input = "discarded draft".into();
+        app.selection = Some((1, 2));
+        let saved = sessions::Session {
+            id: "saved-id".into(),
+            created_at: 10,
+            updated_at: 20,
+            problem: "saved problem".into(),
+            mode: LearningMode::WorkedExample,
+            web_search: true,
+            turns: vec![sessions::StoredTurn {
+                label: "Worked example".into(),
+                action: "initial".into(),
+                detail: None,
+                content: "saved answer".into(),
+                sources: Vec::new(),
+            }],
+        };
+        let mut state = ListState::default();
+        state.select(Some(0));
+        app.popup = Some(Popup::Sessions {
+            query: String::new(),
+            state,
+            sessions: vec![saved],
+            error: None,
+        });
+
+        app.restore_selected_session();
+
+        assert_eq!(app.session_id, "saved-id");
+        assert_eq!(app.target, "saved problem");
+        assert_eq!(app.turns.len(), 1);
+        assert!(app.input.is_empty());
+        assert!(app.selection.is_none());
+        assert!(app.viewport.follow_tail);
+        assert_eq!(app.settings.model, "current-model");
+        assert!(app.status.contains("current provider and model"));
+    }
+
+    #[test]
+    fn restore_save_failure_keeps_active_session_and_generation_intact() {
+        let mut app = test_app();
+        app.persist_sessions = true;
+        app.target = "current".into();
+        app.turns.push(Turn {
+            label: "First question".into(),
+            content: "partial response".into(),
+            detail: None,
+            sources: Vec::new(),
+        });
+        app.active = Some(active(7, LearningAction::Initial));
+        let saved = sessions::Session {
+            id: "saved".into(),
+            created_at: 1,
+            updated_at: 2,
+            problem: "replacement".into(),
+            mode: LearningMode::Socratic,
+            web_search: false,
+            turns: vec![sessions::StoredTurn {
+                label: "First question".into(),
+                action: "initial".into(),
+                detail: None,
+                content: "saved response".into(),
+                sources: Vec::new(),
+            }],
+        };
+        app.popup = Some(Popup::Sessions {
+            query: String::new(),
+            state: ListState::default().with_selected(Some(0)),
+            sessions: vec![saved],
+            error: None,
+        });
+
+        app.restore_selected_session_with(|session| {
+            assert_eq!(session.problem, "current");
+            assert_eq!(session.turns[0].content, "partial response");
+            Err("disk full".into())
+        });
+
+        assert_eq!(app.target, "current");
+        assert_eq!(app.active.as_ref().map(|active| active.id), Some(7));
+        assert!(app.popup.is_some());
+        assert!(app.status.contains("restore cancelled"));
+    }
+
+    #[test]
+    fn new_session_save_failure_does_not_clear_current_session() {
+        let mut app = test_app();
+        app.persist_sessions = true;
+        app.target = "current".into();
+        app.turns.push(Turn {
+            label: "First question".into(),
+            content: "answer".into(),
+            detail: None,
+            sources: Vec::new(),
+        });
+        app.new_problem_with(|_| Err("read only".into()));
+        assert_eq!(app.target, "current");
+        assert_eq!(app.turns.len(), 1);
+        assert!(app.status.contains("new session cancelled"));
+    }
+
+    #[test]
+    fn failed_first_quit_is_visible_and_second_quit_is_forced() {
+        let mut app = test_app();
+        app.request_quit_with(|_| Ok(()), |_| Err("settings locked".into()));
+        assert!(!app.quit_requested);
+        assert!(app.status.contains("Ctrl+Q again"));
+        app.request_quit_with(
+            |_| panic!("force quit must not save"),
+            |_| panic!("force quit must not save"),
+        );
+        assert!(app.quit_requested);
+    }
+
+    #[test]
+    fn control_enter_does_not_activate_popup_choices() {
+        let mut app = test_app();
+        app.open_palette();
+        app.handle_popup_key(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(matches!(app.popup, Some(Popup::Palette { .. })));
+
+        app.open_setting(Command::Theme);
+        let theme = app.settings.theme;
+        app.handle_popup_key(modified_key(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.settings.theme, theme);
+        assert!(matches!(app.popup, Some(Popup::Setting { .. })));
+    }
+
+    #[test]
+    fn narrow_session_rows_stay_fixed_height_for_mouse_hit_testing() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 20)).unwrap();
+        let mut app = test_app();
+        let saved = |id: &str| sessions::Session {
+            id: id.into(),
+            created_at: 1,
+            updated_at: 2,
+            problem: "a title long enough to wrap repeatedly in a narrow popup".into(),
+            mode: LearningMode::Socratic,
+            web_search: false,
+            turns: vec![sessions::StoredTurn {
+                label: "First question".into(),
+                action: "initial".into(),
+                detail: None,
+                content: "answer".into(),
+                sources: Vec::new(),
+            }],
+        };
+        app.popup = Some(Popup::Sessions {
+            query: String::new(),
+            state: ListState::default().with_selected(Some(0)),
+            sessions: vec![saved("first"), saved("second")],
+            error: None,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let area = app.popup_area;
+        app.handle_popup_click(area.x + 2, area.y + 3);
+        assert_eq!(app.session_id, "second");
+    }
+
+    #[test]
+    fn session_picker_keys_filter_navigate_restore_and_close() {
+        let saved = sessions::Session {
+            id: "saved-id".into(),
+            created_at: 10,
+            updated_at: 20,
+            problem: "Algebra practice".into(),
+            mode: LearningMode::Socratic,
+            web_search: false,
+            turns: vec![sessions::StoredTurn {
+                label: "First question".into(),
+                action: "initial".into(),
+                detail: None,
+                content: "What is x?".into(),
+                sources: Vec::new(),
+            }],
+        };
+        let mut app = test_app();
+        app.popup = Some(Popup::Sessions {
+            query: String::new(),
+            state: ListState::default().with_selected(Some(0)),
+            sessions: vec![saved],
+            error: None,
+        });
+
+        app.handle_sessions_key(key(KeyCode::Down));
+        app.handle_sessions_key(key(KeyCode::Char('A')));
+        app.handle_sessions_key(key(KeyCode::Backspace));
+        app.handle_sessions_key(key(KeyCode::Enter));
+        assert_eq!(app.session_id, "saved-id");
+        assert!(app.popup.is_none());
+
+        app.popup = Some(Popup::Sessions {
+            query: String::new(),
+            state: ListState::default(),
+            sessions: Vec::new(),
+            error: None,
+        });
+        app.handle_sessions_key(key(KeyCode::Esc));
+        assert!(app.popup.is_none());
     }
 
     #[test]
@@ -2551,6 +3813,30 @@ mod tests {
         });
         assert_eq!(app.viewport.offset, 77);
         assert!(!app.viewport.follow_tail);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.viewport.offset, 80);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.mouse_down, Some((2, 2)));
+        assert!(app.mouse_dragged);
+        assert!(app.selection.is_some());
     }
 
     #[test]
@@ -2592,6 +3878,39 @@ mod tests {
             app.popup = Some(popup);
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
         }
+
+        let saved = sessions::Session {
+            id: "saved".into(),
+            created_at: 1,
+            updated_at: 1,
+            problem: "Saved problem".into(),
+            mode: LearningMode::Socratic,
+            web_search: false,
+            turns: Vec::new(),
+        };
+        for popup in [
+            Popup::Sessions {
+                query: String::new(),
+                state: ListState::default(),
+                sessions: Vec::new(),
+                error: Some("broken history".into()),
+            },
+            Popup::Sessions {
+                query: "missing".into(),
+                state: ListState::default(),
+                sessions: vec![saved.clone()],
+                error: None,
+            },
+            Popup::Sessions {
+                query: String::new(),
+                state: ListState::default().with_selected(Some(0)),
+                sessions: vec![saved],
+                error: None,
+            },
+        ] {
+            app.popup = Some(popup);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
     }
 
     #[test]
@@ -2612,8 +3931,9 @@ mod tests {
             label: "Hint".into(),
             content: String::new(),
             detail: None,
+            sources: Vec::new(),
         });
-        app.active = Some((7, CancellationToken::new()));
+        app.active = Some(active(7, LearningAction::AnotherHint));
 
         app.handle_response(6, ResponseEvent::Started);
         assert_eq!(app.status, "Ready");
@@ -2633,7 +3953,8 @@ mod tests {
             },
         );
         assert!(app.turns[0].content.contains("safe\nnext"));
-        assert!(app.turns[0].content.contains("Source: Docs"));
+        assert_eq!(app.turns[0].sources[0].title, "Docs");
+        assert!(!app.turns[0].content.contains("Source:"));
         app.handle_response(7, ResponseEvent::Completed);
         assert!(app.active.is_none());
         assert_eq!(app.status, "Complete");
@@ -2648,8 +3969,9 @@ mod tests {
                 label: "Pending".into(),
                 content: String::new(),
                 detail: None,
+                sources: Vec::new(),
             });
-            app.active = Some((8, CancellationToken::new()));
+            app.active = Some(active(8, LearningAction::AnotherHint));
             app.handle_response(8, event);
             assert!(app.active.is_none());
             assert_ne!(
@@ -2670,8 +3992,9 @@ mod tests {
                 label: learning::label(LearningAction::Initial, mode).into(),
                 content: String::new(),
                 detail: None,
+                sources: Vec::new(),
             });
-            app.active = Some((1, CancellationToken::new()));
+            app.active = Some(active(1, LearningAction::Initial));
             assert!(
                 !app.transcript_source()
                     .contains(app.turns[0].label.as_str())
@@ -2710,8 +4033,9 @@ mod tests {
             label: "Question".into(),
             content: "<analysis>still thinking</analysis>".into(),
             detail: None,
+            sources: Vec::new(),
         });
-        app.active = Some((1, CancellationToken::new()));
+        app.active = Some(active(1, LearningAction::Initial));
 
         assert!(!app.transcript_source().contains("Question"));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -2722,7 +4046,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Preparing your first prompt"));
+        assert!(rendered.contains("Asking the first question"));
 
         app.handle_response(
             1,
@@ -2741,11 +4065,13 @@ mod tests {
             label: "Follow-up".into(),
             content: "<think>working</think>".into(),
             detail: Some("my attempt".into()),
+            sources: Vec::new(),
         });
-        app.active = Some((1, CancellationToken::new()));
+        app.active = Some(active(1, LearningAction::FollowUp));
 
         let source = app.transcript_source();
-        assert!(source.contains("You\nmy attempt"));
+        assert!(source.contains("You"));
+        assert!(source.contains("my attempt"));
         assert!(!source.contains("Follow-up"));
     }
 
@@ -2757,8 +4083,9 @@ mod tests {
             label: "Question".into(),
             content: String::new(),
             detail: None,
+            sources: Vec::new(),
         });
-        app.active = Some((3, CancellationToken::new()));
+        app.active = Some(active(3, LearningAction::Initial));
         app.handle_response(3, ResponseEvent::Cancelled);
         assert!(app.turns.is_empty());
         assert_eq!(app.status, "Cancelled");
@@ -2853,6 +4180,7 @@ mod tests {
             label: "old".into(),
             content: "answer".into(),
             detail: None,
+            sources: Vec::new(),
         });
         app.execute_command(Command::NewSession);
         assert!(app.turns.is_empty());
@@ -2936,7 +4264,7 @@ mod tests {
     }
 
     #[test]
-    fn session_title_is_high_contrast_in_every_theme_and_loading_panel_is_visible() {
+    fn session_title_is_high_contrast_in_every_theme_and_inline_pending_is_visible() {
         for theme in [Theme::Latte, Theme::Frappe, Theme::Macchiato, Theme::Mocha] {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             let mut app = test_app();
@@ -2947,8 +4275,9 @@ mod tests {
                 label: "Worked example".into(),
                 content: String::new(),
                 detail: None,
+                sources: Vec::new(),
             });
-            app.active = Some((1, CancellationToken::new()));
+            app.active = Some(active(1, LearningAction::Initial));
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
             let rendered = buffer
@@ -2956,7 +4285,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(rendered.contains("Preparing worked example"));
+            assert!(rendered.contains("Preparing the worked example"));
             let session = buffer
                 .content()
                 .iter()
@@ -3009,6 +4338,7 @@ mod tests {
             label: "Answer".into(),
             content: "text".into(),
             detail: None,
+            sources: Vec::new(),
         });
         app.handle_main_key(modified_key(KeyCode::Right, KeyModifiers::SHIFT));
         assert_eq!(app.selection, Some((0, 1)));
@@ -3023,6 +4353,7 @@ mod tests {
             label: "Question".into(),
             content: "content".into(),
             detail: None,
+            sources: Vec::new(),
         });
         for number in [5, 9, 10, 12, 11] {
             actions.handle_main_key(key(KeyCode::F(number)));
@@ -3255,5 +4586,212 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "run");
+    }
+
+    #[test]
+    fn question_mark_types_in_initial_and_follow_up_inputs_while_f1_opens_help() {
+        let mut app = test_app();
+        app.handle_main_key(key(KeyCode::Char('?')));
+        assert_eq!(app.input, "?");
+        assert_eq!(app.screen, Screen::Main);
+        app.turns.push(Turn {
+            label: "Question".into(),
+            content: "Why?".into(),
+            detail: None,
+            sources: Vec::new(),
+        });
+        app.handle_main_key(key(KeyCode::Char('?')));
+        assert_eq!(app.input, "??");
+        app.handle_main_key(key(KeyCode::F(1)));
+        assert_eq!(app.screen, Screen::Help);
+    }
+
+    #[test]
+    fn tab_toggles_mode_before_session_and_reports_lock_afterward() {
+        let mut app = test_app();
+        app.handle_main_key(key(KeyCode::Tab));
+        assert_eq!(app.mode, LearningMode::WorkedExample);
+        app.turns.push(Turn {
+            label: "Worked example".into(),
+            content: "Answer".into(),
+            detail: None,
+            sources: Vec::new(),
+        });
+        app.handle_main_key(key(KeyCode::Tab));
+        assert_eq!(app.mode, LearningMode::WorkedExample);
+        assert!(app.status.contains("locked"));
+
+        app.open_settings();
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.settings_field, 1);
+        assert_eq!(app.mode, LearningMode::WorkedExample);
+    }
+
+    #[test]
+    fn source_event_does_not_start_visible_text_and_pending_is_action_specific() {
+        let mut app = test_app();
+        app.target = "problem".into();
+        app.turns.push(Turn {
+            label: "Attempt feedback".into(),
+            content: String::new(),
+            detail: Some("attempt".into()),
+            sources: Vec::new(),
+        });
+        app.active = Some(active(4, LearningAction::CheckAttempt));
+        app.handle_response(
+            4,
+            ResponseEvent::Source {
+                title: "Docs".into(),
+                url: "https://example.test/docs".into(),
+            },
+        );
+        assert!(!app.active.as_ref().unwrap().visible_text_started);
+        let plain = app.transcript_rendered_plain();
+        assert!(plain.contains("Checking the attempt"));
+        assert!(plain.contains("attempt"));
+        assert!(!plain.contains("Guide / Attempt feedback"));
+    }
+
+    #[test]
+    fn safe_urls_and_markdown_link_destinations_are_strict() {
+        assert!(safe_url("https://example.test/a?q=1").is_some());
+        assert!(safe_url("http://example.test").is_some());
+        for rejected in [
+            "ftp://example.test/a",
+            "javascript:alert(1)",
+            "https://user@example.test/a",
+            "https://example.test/a\nnext",
+            "not a url",
+        ] {
+            assert!(safe_url(rejected).is_none(), "accepted {rejected:?}");
+        }
+        assert_eq!(
+            markdown_links("See [the **docs**](https://example.test/a) and [bad](file:///tmp/x)."),
+            vec![("the docs".into(), "https://example.test/a".into())]
+        );
+    }
+
+    #[test]
+    fn link_hitboxes_wrap_clip_scroll_and_account_for_wide_characters() {
+        let rendered = RenderedTranscript {
+            text: Text::raw("1234界linktail"),
+            plain: "1234界linktail".into(),
+            links: vec![TranscriptLink {
+                range: 4..9,
+                url: "https://example.test".into(),
+            }],
+        };
+        let body = Rect::new(10, 5, 8, 4);
+        let top = link_hitboxes(&rendered, body, 0);
+        assert_eq!(top.len(), 2);
+        assert!(top.iter().all(|hitbox| (6..8).contains(&hitbox.row)));
+        let scrolled = link_hitboxes(&rendered, body, 1);
+        assert_eq!(scrolled.len(), 1);
+        assert_eq!(scrolled[0].row, body.y + 1);
+        assert!(link_hitboxes(&rendered, body, 3).is_empty());
+    }
+
+    #[test]
+    fn link_hitboxes_follow_word_boundaries_instead_of_character_wrapping() {
+        let rendered = RenderedTranscript {
+            text: Text::raw("abc linked"),
+            plain: "abc linked".into(),
+            links: vec![TranscriptLink {
+                range: 4..10,
+                url: "https://example.test".into(),
+            }],
+        };
+
+        let hitboxes = link_hitboxes(&rendered, Rect::new(2, 3, 9, 5), 0);
+
+        assert_eq!(hitboxes.len(), 1);
+        assert_eq!(hitboxes[0].row, 5);
+        assert_eq!(hitboxes[0].start_column, 3);
+        assert_eq!(hitboxes[0].end_column, 9);
+    }
+
+    #[test]
+    fn text_layout_maps_explicit_short_and_word_wrapped_rows_to_source_indexes() {
+        let value = "abc linked\nxy\nwide 界z";
+        let layout = text_layout(value, 7);
+
+        assert_eq!(layout.index_at(1, 0), 4);
+        assert_eq!(layout.index_at(2, 6), 13);
+        assert_eq!(layout.index_at(3, 0), 14);
+        assert_eq!(layout.index_at(4, 0), 19);
+        assert_eq!(layout.index_at(4, 5), 21);
+    }
+
+    #[test]
+    fn click_opens_link_drag_does_not_popup_blocks_and_failure_redacts_url() {
+        let mut app = test_app();
+        app.link_hitboxes = vec![LinkHitbox {
+            row: 4,
+            start_column: 3,
+            end_column: 8,
+            url: "https://example.test/path?secret=value".into(),
+        }];
+        let mut opened = None;
+        app.open_link_at_with(4, 4, |url| {
+            opened = Some(url.to_owned());
+            Ok::<_, io::Error>(())
+        });
+        assert_eq!(
+            opened.as_deref(),
+            Some("https://example.test/path?secret=value")
+        );
+
+        app.open_link_at_with(4, 4, |_| {
+            Err::<(), _>("https://example.test/path?secret=value")
+        });
+        assert_eq!(app.status, "Could not open link");
+        app.popup = Some(Popup::Palette {
+            query: String::new(),
+            state: ListState::default(),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.status, "Could not open link");
+        app.popup = None;
+        app.mouse_down = Some((4, 4));
+        app.mouse_dragged = true;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_ne!(app.status, "Opened link");
+    }
+
+    #[test]
+    fn transcript_chrome_has_distinct_high_contrast_styles_and_one_socratic_label() {
+        let mut app = test_app();
+        app.target = "Solve it".into();
+        app.turns.push(Turn {
+            label: "First question".into(),
+            content: "What do you know?".into(),
+            detail: None,
+            sources: Vec::new(),
+        });
+        let rendered = app.transcript_rendered_result();
+        assert_eq!(rendered.plain.matches("First question").count(), 1);
+        let headers = rendered
+            .text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.bg.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(headers.len(), 2);
+        assert!(
+            headers
+                .iter()
+                .all(|span| span.style.fg == Some(palette(Theme::Mocha).base))
+        );
     }
 }

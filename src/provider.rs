@@ -39,7 +39,7 @@ pub struct GenerateRequest {
     pub web_search: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LearningMode {
     Socratic,
@@ -501,7 +501,7 @@ fn learning_prompt(request: &GenerateRequest) -> Result<String, String> {
         (LearningMode::Socratic, LearningAction::Initial) => {
             r#"ACTION: INITIAL_SOCRATIC_QUESTION
 
-Ask exactly one concise, purposeful question that diagnoses the learner's understanding or surfaces the first useful distinction needed for the target. You may use one short setup sentence before the question. Do not provide ingredients, steps, a worked analogy, a list of questions, or any part of the solution. Use the heading `## First question`."#
+Ask exactly one concise, purposeful question that diagnoses the learner's understanding or surfaces the first useful distinction needed for the target. You may use one short setup sentence before the question. Do not provide ingredients, steps, a worked analogy, a list of questions, any part of the solution, or an outer response heading. The application supplies the question heading."#
         }
         (LearningMode::WorkedExample, LearningAction::Initial) => {
             r#"ACTION: INITIAL_WORKED_EXAMPLE
@@ -525,42 +525,42 @@ Verify the result independently using substitution, estimation, inverse operatio
         (LearningMode::WorkedExample, LearningAction::FollowUp) => {
             r#"ACTION: WORKED_EXAMPLE_FOLLOW_UP
 
-Answer the learner's question about the completed worked example directly and self-containedly. Re-explain, compare methods, correct a misunderstanding, or expand a step as requested. You may refer to the target result because this mode already revealed it. Do not repeat the entire solution unless the learner asks. Use the heading `## Follow-up`."#
+Answer the learner's question about the completed worked example directly and self-containedly. Re-explain, compare methods, correct a misunderstanding, or expand a step as requested. You may refer to the target result because this mode already revealed it. Do not repeat the entire solution unless the learner asks. Do not add an outer response heading; the application supplies it."#
         }
         (LearningMode::WorkedExample, LearningAction::ExplainTerm) => {
             r#"ACTION: EXPLAIN_TERM
 
-Explain the learner-identified term in the context of the completed worked example. Give a concise plain-language definition and one tiny contextual example or contrast. You may refer to the already revealed target result, but do not repeat the full solution. Use the heading `## Term explanation`."#
+Explain the learner-identified term in the context of the completed worked example. Give a concise plain-language definition and one tiny contextual example or contrast. You may refer to the already revealed target result, but do not repeat the full solution. Do not add an outer response heading; the application supplies it."#
         }
         (LearningMode::Socratic, LearningAction::AnotherHint) => {
             r#"ACTION: ANOTHER_HINT
 
-Provide one minimal hint phrased as a leading question. It may expose one concept or relationship, but must return the reasoning to the learner immediately. Do not repeat an earlier question, explain the full method, perform the decisive calculation, or reveal the target answer. Use the heading `## Guiding question`."#
+Provide one minimal hint phrased as a leading question. It may expose one concept or relationship, but must return the reasoning to the learner immediately. Do not repeat an earlier question, explain the full method, perform the decisive calculation, reveal the target answer, or add an outer response heading. The application supplies the heading."#
         }
         (LearningMode::Socratic, LearningAction::SocraticResponse) => {
             r#"ACTION: SOCRATIC_RESPONSE
 
-Respond to the learner's answer in at most three concise sentences: acknowledge what is sound, identify one misconception or missing distinction if present, and ask exactly one next question that advances their reasoning. Do not provide a worked example, solution outline, decisive calculation, or target answer. Use the heading `## Next question`."#
+Respond to the learner's answer in at most three concise sentences: acknowledge what is sound, identify one misconception or missing distinction if present, and ask exactly one next question that advances their reasoning. Do not provide a worked example, solution outline, decisive calculation, target answer, or an outer response heading. The application supplies the question heading."#
         }
         (LearningMode::Socratic, LearningAction::ExplainTerm) => {
             r#"ACTION: EXPLAIN_TERM
 
-Explain the learner-identified term in plain language and in the target problem's context. Give one tiny example or contrast that does not complete the target's decisive work, then ask exactly one brief check-for-understanding question. Do not reveal the target answer. Use the heading `## Term explanation`."#
+Explain the learner-identified term in plain language and in the target problem's context. Give one tiny example or contrast that does not complete the target's decisive work, then ask exactly one brief check-for-understanding question. Do not reveal the target answer or add an outer response heading. The application supplies the heading."#
         }
         (LearningMode::Socratic, LearningAction::ExplainStep) => {
             r#"ACTION: EXPLAIN_STEP
 
-Explain only the learner-identified step or question. Connect it to the analogous example when useful. End with a small check for understanding. Do not finish the target problem or reveal its answer. Use the heading `## Step explanation`."#
+Explain only the learner-identified step or question. Connect it to the analogous example when useful. End with a small check for understanding. Do not finish the target problem, reveal its answer, or add an outer response heading. The application supplies the heading."#
         }
         (LearningMode::Socratic, LearningAction::CheckAttempt) => {
             r#"ACTION: CHECK_ATTEMPT
 
-Review the learner's work. State what is correct, identify the earliest useful error or uncertainty, explain how to correct it, and give one next step. Do not continue through to the target answer. Use the heading `## Attempt feedback`."#
+Review the learner's work. State what is correct, identify the earliest useful error or uncertainty, explain how to correct it, and give one next step. Do not continue through to the target answer or add an outer response heading. The application supplies the heading."#
         }
         (LearningMode::Socratic, LearningAction::RevealSolution) => {
             r#"ACTION: REVEAL_SOLUTION
 
-The learner explicitly chose to reveal the target solution. Solve the exact target problem completely, show all important steps, clearly identify the result, and verify it. Use the heading `## Target solution`."#
+The learner explicitly chose to reveal the target solution. Solve the exact target problem completely, show all important steps, clearly identify the result, and verify it. Do not add an outer response heading; the application supplies it."#
         }
         (LearningMode::WorkedExample, _) | (LearningMode::Socratic, LearningAction::FollowUp) => {
             unreachable!()
@@ -1047,7 +1047,8 @@ mod tests {
         let prompt = learning_prompt(&request(LearningAction::Initial)).unwrap();
 
         assert!(prompt.contains("ACTION: INITIAL_SOCRATIC_QUESTION"));
-        assert!(prompt.contains("## First question"));
+        assert!(!prompt.contains("## First question"));
+        assert!(prompt.contains("application supplies the question heading"));
         assert!(prompt.contains("Do not provide ingredients, steps, a worked analogy"));
     }
 
